@@ -239,15 +239,27 @@ class Mem0Base(MemoryInterface):
         """
         self.user_id = user_id or "default_user"
         self.collection_name = collection_name or f"memory_store_{self.user_id}"
+
+        # Build Qdrant config for local or cloud
+        qdrant_config = {
+            "collection_name": self.collection_name,
+            "embedding_model_dims": 768,
+        }
+
+        # For Qdrant Cloud, use url instead of host/port
+        if config.mem0.qdrant_api_key or config.mem0.qdrant_host.startswith("http"):
+            qdrant_config["url"] = config.mem0.qdrant_host
+            if config.mem0.qdrant_api_key:
+                qdrant_config["api_key"] = config.mem0.qdrant_api_key
+        else:
+            # Local Qdrant
+            qdrant_config["host"] = config.mem0.qdrant_host
+            qdrant_config["port"] = int(config.mem0.qdrant_port)
+
         self._config = MemoryConfig(
             vector_store=VectorStoreConfig(
                 provider="qdrant",
-                config={
-                    "host": config.mem0.qdrant_host,
-                    "port": int(config.mem0.qdrant_port),
-                    "collection_name": self.collection_name,
-                    "embedding_model_dims": 768,
-                }
+                config=qdrant_config
             ),
             llm=LlmConfig(
                 provider="gemini",

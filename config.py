@@ -25,7 +25,9 @@ class GeminiConfig:
 class Mem0Config:
     """Mem0 configuration."""
     qdrant_host: str = field(default_factory=lambda: os.getenv("MEM0_QDRANT_HOST", "localhost"))
-    qdrant_port: int = field(default_factory=lambda: os.getenv("MEM0_QDRANT_PORT", "6333"))
+    qdrant_port: str = field(default_factory=lambda: os.getenv("MEM0_QDRANT_PORT", "6333"))
+    qdrant_api_key: str = field(default_factory=lambda: os.getenv("QDRANT_API_KEY", ""))
+    qdrant_https: bool = field(default_factory=lambda: os.getenv("QDRANT_HTTPS", "false").lower() == "true")
     neo4j_uri: str = field(default_factory=lambda: os.getenv("MEM0_NEO4J_URI", "bolt://localhost:7687"))
     neo4j_user: str = field(default_factory=lambda: os.getenv("MEM0_NEO4J_USER", "neo4j"))
     neo4j_password: str = field(default_factory=lambda: os.getenv("MEM0_NEO4J_PASSWORD", "password123"))
