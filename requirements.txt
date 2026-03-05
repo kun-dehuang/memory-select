@@ -3,9 +3,8 @@ streamlit>=1.39.0
 python-dotenv>=1.0.0
 
 # LLM
-# 修复 Railway 环境中 google protobuf 命名冲突
-google-api-core>=2.11.0
-google-generativeai>=0.8.0,<1.0.0
+# mem0ai fork 使用新版 google-genai SDK (不是 google-generativeai)
+google-genai>=1.0.0
 
 # Mem0 - Production: 使用 GitHub fork 版本
 # 本地开发: cd /Users/myles/Projects/Pupixel/mem0-code && pip install -e .

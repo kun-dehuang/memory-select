@@ -4,7 +4,7 @@ nixPkgs = ["python311"]
 [phases.build]
 cmds = [
   "pip install --upgrade pip setuptools wheel",
-  "pip install google-api-core>=2.11.0 google-generativeai>=0.8.0,<1.0.0",
+  "pip install google-genai>=1.0.0",
   "pip install -r requirements.txt"
 ]
 

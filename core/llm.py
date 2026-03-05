@@ -1,25 +1,38 @@
 """Gemini LLM client for memory operations."""
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from typing import Optional, List
 from config import config
 
 
 class GeminiClient:
-    """Wrapper for Google Generative AI client."""
+    """Wrapper for Google Generative AI client (使用新版 SDK)."""
 
     def __init__(self):
         """Initialize Gemini client."""
         if not config.gemini.api_key:
             raise ValueError("GEMINI_API_KEY is required")
 
-        genai.configure(api_key=config.gemini.api_key)
-        self.model = genai.GenerativeModel(config.gemini.model)
+        self.client = genai.Client(api_key=config.gemini.api_key)
+        self.model_name = config.gemini.model
+
+    def _generate_text(self, prompt: str) -> str:
+        """Generate text from prompt using new SDK."""
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=prompt
+        )
+        # Extract text from response
+        if response.candidates and response.candidates[0].content.parts:
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'text') and part.text:
+                    return part.text
+        return ""
 
     def generate(self, prompt: str, **kwargs) -> str:
         """Generate text from prompt."""
-        response = self.model.generate_content(prompt, **kwargs)
-        return response.text
+        return self._generate_text(prompt)
 
     def generate_answer(self, question: str, memory_context: List[str]) -> str:
         """Generate answer based on retrieved memory fragments.
@@ -53,8 +66,7 @@ class GeminiClient:
 请回答："""
 
         try:
-            response = self.model.generate_content(prompt)
-            return response.text.strip()
+            return self._generate_text(prompt).strip()
         except Exception as e:
             return f"[生成答案失败: {str(e)}]"
 
@@ -115,8 +127,7 @@ class GeminiClient:
 请回答："""
 
         try:
-            response = self.model.generate_content(prompt)
-            return response.text.strip()
+            return self._generate_text(prompt).strip()
         except Exception as e:
             return f"[生成答案失败: {str(e)}]"
 
@@ -127,9 +138,9 @@ Return as JSON list with format: {{"entity": "name", "type": "PERSON|LOCATION|EV
 
 Text: {text}"""
         try:
-            response = self.model.generate_content(prompt)
             import json
-            return json.loads(response.text)
+            response_text = self._generate_text(prompt)
+            return json.loads(response_text)
         except Exception:
             return []
 
@@ -153,9 +164,9 @@ Return as JSON with format:
 
 Text: {text}"""
         try:
-            response = self.model.generate_content(prompt)
             import json
-            result = json.loads(response.text)
+            response_text = self._generate_text(prompt)
+            result = json.loads(response_text)
             entities = result.get("entities", [])
             relations = result.get("relations", [])
             return entities, relations
@@ -163,14 +174,14 @@ Text: {text}"""
             return [], []
 
     def embed_text(self, text: str) -> list[float]:
-        """Get embedding for text."""
-        import google.generativeai as genai
-        result = genai.embed_content(
+        """Get embedding for text using new SDK."""
+        config = types.EmbedContentConfig(output_dimensionality=768)
+        response = self.client.models.embed_content(
             model="models/text-embedding-004",
-            content=text,
-            task_type="retrieval_document"
+            contents=text,
+            config=config
         )
-        return result["embedding"]
+        return response.embeddings[0].values
 
 
 # Singleton instance
