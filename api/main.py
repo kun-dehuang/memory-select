@@ -67,6 +67,40 @@ async def get_openai_functions_schema() -> OpenAIFunctionsResponse:
     return OpenAIFunctionsResponse(functions=OPENAI_FUNCTIONS_SCHEMA["functions"])
 
 
+@app.get("/api/v1/config/debug", tags=["debug"])
+async def config_debug() -> dict:
+    """Debug endpoint to check configuration (hides sensitive data)."""
+    from config import config
+    import os
+
+    # Mask password for security
+    neo4j_password_masked = "***" if config.mem0.neo4j_password else "(empty)"
+
+    return {
+        "neo4j": {
+            "uri": config.mem0.neo4j_uri,
+            "user": config.mem0.neo4j_user,
+            "password_set": len(config.mem0.neo4j_password) > 0,
+        },
+        "qdrant": {
+            "host": config.mem0.qdrant_host,
+            "api_key_set": len(config.mem0.qdrant_api_key) > 0,
+        },
+        "gemini": {
+            "api_key_set": len(config.gemini.api_key) > 0,
+            "model": config.gemini.model,
+        },
+        "env_raw": {
+            "MEM0_NEO4J_URI": os.getenv("MEM0_NEO4J_URI", "not set"),
+            "MEM0_NEO4J_USER": os.getenv("MEM0_NEO4J_USER", "not set"),
+            "MEM0_NEO4J_PASSWORD": "***" if os.getenv("MEM0_NEO4J_PASSWORD") else "not set",
+            "MEM0_QDRANT_HOST": os.getenv("MEM0_QDRANT_HOST", "not set"),
+            "QDRANT_API_KEY": "***" if os.getenv("QDRANT_API_KEY") else "not set",
+            "GEMINI_API_KEY": "***" if os.getenv("GEMINI_API_KEY") else "not set",
+        }
+    }
+
+
 # Root endpoint
 @app.get("/", tags=["root"])
 async def root():
