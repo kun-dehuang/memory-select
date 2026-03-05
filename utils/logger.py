@@ -5,18 +5,25 @@ This module provides detailed logging for:
 - Entity/relationship extraction (graph)
 - Memory comparison operations
 - API calls and responses
+- API request/response logging
 """
 
 import logging
 import sys
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 import json
+import threading
+from collections import deque
 
 
 class DebugLogger:
     """Enhanced logger for debugging memory operations."""
+
+    # Class-level storage for logs shared across all instances
+    _api_logs: deque = deque(maxlen=1000)  # Store up to 1000 log entries
+    _logs_lock = threading.Lock()
 
     def __init__(self, name: str = "memory_debug", log_dir: Optional[Path] = None):
         """Initialize debug logger.
@@ -270,6 +277,251 @@ class DebugLogger:
                 self.logger.debug(f"  Results: {results}")
         else:
             self.logger.debug("  No results found")
+
+    def log_api_request(
+        self,
+        endpoint: str,
+        method: str = "POST",
+        uid: str = None,
+        request_data: Dict = None,
+        **kwargs
+    ):
+        """Log API request details and store in memory for API querying.
+
+        Args:
+            endpoint: API endpoint path
+            method: HTTP method
+            uid: User ID
+            request_data: Request body data
+            **kwargs: Additional request parameters
+        """
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "type": "api_request",
+            "level": "INFO",
+            "endpoint": endpoint,
+            "method": method,
+            "uid": uid,
+            "request_data": DebugLogger._sanitize_for_logging(request_data),
+        }
+        log_entry.update(kwargs)
+
+        self.logger.info(f"[API REQUEST] {method} {endpoint}")
+        if uid:
+            self.logger.info(f"  User: {uid}")
+        if request_data:
+            self.logger.debug(f"  Request: {json.dumps(request_data, ensure_ascii=False, indent=2)}")
+
+        self._store_log(log_entry)
+
+    def log_api_response(
+        self,
+        endpoint: str,
+        status: str = "success",
+        response_data: Dict = None,
+        duration_ms: float = None,
+        error: str = None,
+        **kwargs
+    ):
+        """Log API response details and store in memory for API querying.
+
+        Args:
+            endpoint: API endpoint path
+            status: Response status ('success' or 'error')
+            response_data: Response data
+            duration_ms: Request duration in milliseconds
+            error: Error message if status is 'error'
+            **kwargs: Additional response parameters
+        """
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "type": "api_response",
+            "level": "ERROR" if status == "error" else "INFO",
+            "endpoint": endpoint,
+            "status": status,
+            "response_data": DebugLogger._sanitize_for_logging(response_data),
+            "duration_ms": duration_ms,
+            "error": error,
+        }
+        log_entry.update(kwargs)
+
+        if status == "error":
+            self.logger.error(f"[API RESPONSE] {endpoint} - ERROR: {error}")
+        else:
+            self.logger.info(f"[API RESPONSE] {endpoint} - SUCCESS")
+            if duration_ms is not None:
+                self.logger.info(f"  Duration: {duration_ms:.2f}ms")
+            if response_data:
+                self.logger.debug(f"  Response: {json.dumps(response_data, ensure_ascii=False, indent=2)}")
+
+        self._store_log(log_entry)
+
+    def log_fact_split(self, text: str, facts: list, entities: list = None, relations: list = None):
+        """Log fact extraction and split results from mem0 add operation.
+
+        Args:
+            text: Original input text
+            facts: List of extracted facts
+            entities: List of extracted entities (from graph)
+            relations: List of extracted relations (from graph)
+        """
+        self.logger.info("[FACT SPLIT]")
+        self.logger.debug(f"  Input: {text}")
+
+        if facts:
+            self.logger.info(f"  Facts extracted: {len(facts)}")
+            for i, fact in enumerate(facts):
+                self.logger.debug(f"    [{i}] {fact}")
+        else:
+            self.logger.warning("  No facts extracted")
+
+        if entities:
+            self.logger.info(f"  Entities extracted: {len(entities)}")
+            for i, entity in enumerate(entities[:10]):
+                self.logger.debug(f"    [{i}] {entity}")
+        else:
+            self.logger.debug("  No entities extracted")
+
+        if relations:
+            self.logger.info(f"  Relations extracted: {len(relations)}")
+            for i, rel in enumerate(relations[:10]):
+                self.logger.debug(f"    [{i}] {rel}")
+        else:
+            self.logger.debug("  No relations extracted")
+
+        # Store in memory for API querying
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "type": "fact_split",
+            "level": "INFO",
+            "input_text": text[:500],  # Limit stored text length
+            "facts": facts,
+            "entities": entities[:20] if entities else [],  # Limit stored entities
+            "relations": relations[:20] if relations else [],  # Limit stored relations
+        }
+        self._store_log(log_entry)
+
+    def log_search_results(self, query: str, results: list, relations: list = None, **kwargs):
+        """Log search results with full details for API querying.
+
+        Args:
+            query: Search query
+            results: Raw search results with all fields
+            relations: Graph relations returned
+            **kwargs: Additional search parameters
+        """
+        self.logger.info("[SEARCH RESULTS]")
+        self.logger.info(f"  Query: {query}")
+        self.logger.info(f"  Results count: {len(results)}")
+
+        for i, r in enumerate(results[:5]):
+            if isinstance(r, dict):
+                self.logger.debug(f"    [{i}] score={r.get('score', 'N/A')}: {r.get('content', str(r))}")
+            else:
+                self.logger.debug(f"    [{i}] {r}")
+
+        if relations:
+            self.logger.info(f"  Relations count: {len(relations)}")
+            for i, rel in enumerate(relations[:5]):
+                self.logger.debug(f"    [{i}] {rel}")
+
+        # Store in memory for API querying
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "type": "search_results",
+            "level": "INFO",
+            "query": query,
+            "results_count": len(results),
+            "results": results[:10],  # Limit stored results
+            "relations": relations[:20] if relations else [],  # Limit stored relations
+        }
+        log_entry.update(kwargs)
+        self._store_log(log_entry)
+
+    @staticmethod
+    def _sanitize_for_logging(data: Any) -> Any:
+        """Sanitize data for logging (remove sensitive fields, limit sizes).
+
+        Args:
+            data: Data to sanitize
+
+        Returns:
+            Sanitized data
+        """
+        if not data:
+            return data
+
+        if isinstance(data, dict):
+            sanitized = {}
+            for key, value in data.items():
+                # Skip sensitive fields
+                if key.lower() in ["api_key", "password", "token", "secret"]:
+                    sanitized[key] = "***"
+                elif isinstance(value, (dict, list)):
+                    sanitized[key] = DebugLogger._sanitize_for_logging(value)
+                elif isinstance(value, str) and len(value) > 1000:
+                    sanitized[key] = value[:1000] + "... (truncated)"
+                else:
+                    sanitized[key] = value
+            return sanitized
+        elif isinstance(data, list):
+            return [DebugLogger._sanitize_for_logging(item) for item in data[:100]]  # Limit list size
+        elif isinstance(data, str) and len(data) > 1000:
+            return data[:1000] + "... (truncated)"
+        return data
+
+    def _store_log(self, log_entry: Dict):
+        """Store log entry in memory for API querying.
+
+        Args:
+            log_entry: Log entry dictionary
+        """
+        with self._logs_lock:
+            self._api_logs.append(log_entry)
+
+    @classmethod
+    def get_recent_logs(
+        cls,
+        level: str = None,
+        limit: int = 100,
+        search: str = None,
+        log_type: str = None
+    ) -> List[Dict]:
+        """Get recent logs from memory storage.
+
+        Args:
+            level: Filter by log level (INFO, DEBUG, ERROR)
+            limit: Maximum number of logs to return (default 100)
+            search: Search keyword filter
+            log_type: Filter by log type (api_request, api_response, fact_split, search_results)
+
+        Returns:
+            List of log entries
+        """
+        with cls._logs_lock:
+            logs = list(cls._api_logs)
+
+        # Apply filters
+        if level:
+            logs = [log for log in logs if log.get("level") == level.upper()]
+        if log_type:
+            logs = [log for log in logs if log.get("type") == log_type]
+        if search:
+            search_lower = search.lower()
+            logs = [
+                log for log in logs
+                if search_lower in json.dumps(log, ensure_ascii=False).lower()
+            ]
+
+        # Sort by timestamp descending and limit
+        logs.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+        return logs[:limit]
+
+    @classmethod
+    def clear_logs(cls):
+        """Clear all stored logs from memory."""
+        with cls._logs_lock:
+            cls._api_logs.clear()
 
 
 # Global logger instance

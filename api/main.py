@@ -2,6 +2,7 @@
 
 This module provides the main FastAPI application with:
 - CORS middleware configuration
+- API logging middleware
 - Route registration
 - Health check endpoints
 - OpenAI function schema endpoint
@@ -12,7 +13,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import memory_router
+from api.routes import memory_router, logs_router
+from api.middleware import APILoggingMiddleware
 from api.schemas.openai_functions import OPENAI_FUNCTIONS_SCHEMA
 from api.schemas.responses import HealthResponse, OpenAIFunctionsResponse
 
@@ -41,8 +43,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add API logging middleware
+app.add_middleware(APILoggingMiddleware)
+
 # Register routes
 app.include_router(memory_router)
+
+# Register logs router
+app.include_router(logs_router)
 
 # Also register the router at the root for compatibility
 app.include_router(memory_router, prefix="")
