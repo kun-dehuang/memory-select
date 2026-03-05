@@ -176,6 +176,78 @@ async def test_mem0_init() -> dict:
     return result
 
 
+@app.get("/api/v1/config/show-mem0-config", tags=["debug"])
+async def show_mem0_config() -> dict:
+    """Show the actual mem0 configuration (without sensitive data)."""
+    from config import config
+    from mem0.configs.base import MemoryConfig, VectorStoreConfig, GraphStoreConfig, LlmConfig
+    from mem0.embeddings.configs import EmbedderConfig
+
+    # Build the same config that Mem0Base uses
+    qdrant_config = {
+        "collection_name": "test_collection",
+        "embedding_model_dims": 768,
+    }
+
+    if config.mem0.qdrant_api_key or config.mem0.qdrant_host.startswith("http"):
+        qdrant_config["url"] = config.mem0.qdrant_host
+        if config.mem0.qdrant_api_key:
+            qdrant_config["api_key"] = "***"
+    else:
+        qdrant_config["host"] = config.mem0.qdrant_host
+        qdrant_config["port"] = int(config.mem0.qdrant_port)
+
+    graph_config = {
+        "url": config.mem0.neo4j_uri,
+        "username": config.mem0.neo4j_user,
+        "password": "***",
+        "database": "neo4j",
+    }
+
+    return {
+        "qdrant_config": qdrant_config,
+        "graph_config": graph_config,
+        "neo4j_uri_from_config": config.mem0.neo4j_uri,
+        "neo4j_user_from_config": config.mem0.neo4j_user,
+        "neo4j_password_length": len(config.mem0.neo4j_password),
+    }
+
+
+@app.get("/api/v1/config/test-add", tags=["debug"])
+async def test_add_endpoint() -> dict:
+    """Test the actual add operation."""
+    from api.dependencies import get_memory_instance
+
+    result = {
+        "status": "unknown",
+        "error": None
+    }
+
+    try:
+        # This is exactly what the add endpoint does
+        memory = get_memory_instance("test_debug_user")
+        result["memory_instance_created"] = True
+
+        # Try to add a memory
+        memory_id = await memory.add(
+            uid="test_debug_user",
+            text="这是一个测试记忆",
+            metadata={}
+        )
+        result["status"] = "SUCCESS"
+        result["memory_id"] = memory_id
+    except Exception as e:
+        result["status"] = "FAILED"
+        result["error"] = str(e)
+        result["error_type"] = type(e).__name__
+
+        # Try to get more info about the error
+        import traceback
+        result["traceback"] = traceback.format_exc()
+
+    return result
+
+
 # Root endpoint
 @app.get("/", tags=["root"])
 async def root():
