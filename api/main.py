@@ -180,26 +180,63 @@ async def test_mem0_init() -> dict:
         result["traceback"] = traceback.format_exc()
 
     return result
-async def test_mem0_init() -> dict:
-    """Test Mem0Graph initialization."""
-    from core.mem0_wrapper import Mem0Graph
-    import traceback
+
+
+@app.get("/api/v1/config/test-mem0-internal", tags=["debug"])
+async def test_mem0_internal_neo4j() -> dict:
+    """Test Neo4j connection exactly like mem0 MemoryGraph does."""
+    from langchain_neo4j import Neo4jGraph
+    from config import config
+    import os
+
+    # Read env vars directly like Mem0Base does
+    neo4j_uri = os.getenv("MEM0_NEO4J_URI", "bolt://localhost:7687")
+    neo4j_user = os.getenv("MEM0_NEO4J_USER", "neo4j")
+    neo4j_password = os.getenv("MEM0_NEO4J_PASSWORD", "password123")
 
     result = {
-        "status": "unknown",
-        "error": None,
-        "traceback": None
+        "env_vars": {
+            "uri": neo4j_uri,
+            "user": neo4j_user,
+            "password_length": len(neo4j_password),
+        },
+        "test1_positional_args": None,
+        "test2_keyword_args": None,
+        "error": None
     }
 
+    # Test 1: Using positional args (like MemoryGraph does)
     try:
-        # Try to create a Mem0Graph instance
-        graph = Mem0Graph(user_id="test_debug_user")
-        result["status"] = "SUCCESS - Mem0Graph created"
-        result["note"] = "Instance created but connection not fully tested"
+        graph1 = Neo4jGraph(
+            neo4j_uri,
+            neo4j_user,
+            neo4j_password,
+            "neo4j",
+            refresh_schema=False,
+            driver_config={"notifications_min_severity": "OFF"},
+        )
+        # Try a simple query
+        graph1.query("RETURN 1 AS test")
+        result["test1_positional_args"] = "SUCCESS"
     except Exception as e:
-        result["status"] = f"FAILED - {str(e)}"
+        result["test1_positional_args"] = f"FAILED - {str(e)}"
         result["error"] = str(e)
-        result["traceback"] = traceback.format_exc()
+
+    # Test 2: Using keyword args (like test-neo4j does)
+    try:
+        graph2 = Neo4jGraph(
+            url=neo4j_uri,
+            username=neo4j_user,
+            password=neo4j_password,
+            database="neo4j",
+            refresh_schema=False
+        )
+        graph2.query("RETURN 1 AS test")
+        result["test2_keyword_args"] = "SUCCESS"
+    except Exception as e:
+        result["test2_keyword_args"] = f"FAILED - {str(e)}"
+        if result["error"] is None:
+            result["error"] = str(e)
 
     return result
 
