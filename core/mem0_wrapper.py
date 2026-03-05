@@ -281,6 +281,7 @@ class Mem0Base(MemoryInterface):
                     "url": config.mem0.neo4j_uri,
                     "username": config.mem0.neo4j_user,
                     "password": config.mem0.neo4j_password,
+                    "database": "neo4j",  # Neo4j Aura 默认数据库名
                 },
                 llm=LlmConfig(
                     provider="gemini",
