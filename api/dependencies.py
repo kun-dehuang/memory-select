@@ -1,6 +1,5 @@
 """FastAPI dependencies for dependency injection."""
 
-from functools import lru_cache
 from typing import Annotated, Optional
 
 from fastapi import Depends
@@ -8,11 +7,12 @@ from fastapi import Depends
 from core.mem0_wrapper import Mem0Graph
 
 
-@lru_cache(maxsize=128)
+# 使用简单的字典缓存，不使用 lru_cache 以避免配置更新后的问题
+_memory_instances: dict[str, Mem0Graph] = {}
+
+
 def get_memory_instance(uid: str) -> Mem0Graph:
     """Get or create a Mem0Graph instance for a user.
-
-    Uses LRU cache to reuse instances for the same user ID.
 
     Args:
         uid: User ID for memory isolation
@@ -20,6 +20,8 @@ def get_memory_instance(uid: str) -> Mem0Graph:
     Returns:
         Mem0Graph instance
     """
+    # 每次创建新实例以确保使用最新配置
+    # Mem0Graph 内部已处理 user_id 隔离，缓存不是必需的
     return Mem0Graph(user_id=uid)
 
 
