@@ -150,38 +150,6 @@ async def test_neo4j_connection() -> dict:
 
     return result
 
-
-@app.get("/api/v1/config/test-mem0", tags=["debug"])
-async def test_mem0_init() -> dict:
-    """Test Mem0Graph initialization."""
-    from core.mem0_wrapper import Mem0Graph
-    import traceback
-    import os
-
-    result = {
-        "env_direct": {
-            "uri": os.getenv("MEM0_NEO4J_URI"),
-            "user": os.getenv("MEM0_NEO4J_USER"),
-            "password_length": len(os.getenv("MEM0_NEO4J_PASSWORD", "")),
-        },
-        "status": "unknown",
-        "error": None,
-        "traceback": None
-    }
-
-    try:
-        # Try to create a Mem0Graph instance
-        graph = Mem0Graph(user_id="test_debug_user")
-        result["status"] = "SUCCESS - Mem0Graph created"
-        result["note"] = "Instance created but connection not fully tested"
-    except Exception as e:
-        result["status"] = f"FAILED - {str(e)}"
-        result["error"] = str(e)
-        result["traceback"] = traceback.format_exc()
-
-    return result
-
-
 @app.get("/api/v1/config/test-mem0-internal", tags=["debug"])
 async def test_mem0_internal_neo4j() -> dict:
     """Test Neo4j connection exactly like mem0 MemoryGraph does."""
@@ -276,42 +244,6 @@ async def show_mem0_config() -> dict:
         "neo4j_user_from_config": config.mem0.neo4j_user,
         "neo4j_password_length": len(config.mem0.neo4j_password),
     }
-
-
-@app.get("/api/v1/config/test-add", tags=["debug"])
-async def test_add_endpoint() -> dict:
-    """Test the actual add operation."""
-    from api.dependencies import get_memory_instance
-
-    result = {
-        "status": "unknown",
-        "error": None
-    }
-
-    try:
-        # This is exactly what the add endpoint does
-        memory = get_memory_instance("test_debug_user")
-        result["memory_instance_created"] = True
-
-        # Try to add a memory
-        memory_id = await memory.add(
-            uid="test_debug_user",
-            text="这是一个测试记忆",
-            metadata={}
-        )
-        result["status"] = "SUCCESS"
-        result["memory_id"] = memory_id
-    except Exception as e:
-        result["status"] = "FAILED"
-        result["error"] = str(e)
-        result["error_type"] = type(e).__name__
-
-        # Try to get more info about the error
-        import traceback
-        result["traceback"] = traceback.format_exc()
-
-    return result
-
 
 # Root endpoint
 @app.get("/", tags=["root"])
