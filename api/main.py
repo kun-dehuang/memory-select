@@ -73,9 +73,6 @@ async def config_debug() -> dict:
     from config import config
     import os
 
-    # Mask password for security
-    neo4j_password_masked = "***" if config.mem0.neo4j_password else "(empty)"
-
     return {
         "neo4j": {
             "uri": config.mem0.neo4j_uri,
@@ -99,6 +96,59 @@ async def config_debug() -> dict:
             "GEMINI_API_KEY": "***" if os.getenv("GEMINI_API_KEY") else "not set",
         }
     }
+
+
+@app.get("/api/v1/config/test-neo4j", tags=["debug"])
+async def test_neo4j_connection() -> dict:
+    """Test Neo4j connection directly."""
+    from config import config
+    import traceback
+
+    result = {
+        "config": {
+            "uri": config.mem0.neo4j_uri,
+            "user": config.mem0.neo4j_user,
+            "password_set": len(config.mem0.neo4j_password) > 0,
+        },
+        "connection_test": None,
+        "langchain_test": None,
+        "error": None
+    }
+
+    # Test 1: Direct neo4j driver connection
+    try:
+        from neo4j import GraphDatabase
+        driver = GraphDatabase.driver(
+            config.mem0.neo4j_uri,
+            auth=(config.mem0.neo4j_user, config.mem0.neo4j_password)
+        )
+        driver.verify_connectivity()
+        result["connection_test"] = "SUCCESS - Direct driver connection works"
+        driver.close()
+    except Exception as e:
+        result["connection_test"] = f"FAILED - {str(e)}"
+        result["error"] = str(e)
+
+    # Test 2: langchain_neo4j connection
+    try:
+        from langchain_neo4j import Neo4jGraph
+        graph = Neo4jGraph(
+            url=config.mem0.neo4j_uri,
+            username=config.mem0.neo4j_user,
+            password=config.mem0.neo4j_password,
+            database="neo4j",
+            refresh_schema=False
+        )
+        # Try a simple query
+        graph.query("RETURN 1 AS test")
+        result["langchain_test"] = "SUCCESS - langchain_neo4j works"
+    except Exception as e:
+        result["langchain_test"] = f"FAILED - {str(e)}"
+        if result["error"] is None:
+            result["error"] = f"langchain: {str(e)}"
+        result["traceback"] = traceback.format_exc()
+
+    return result
 
 
 # Root endpoint
