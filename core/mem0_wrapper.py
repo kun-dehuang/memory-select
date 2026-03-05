@@ -237,8 +237,20 @@ class Mem0Base(MemoryInterface):
             user_id: User ID for isolation
             collection_name: Optional custom collection name
         """
+        import os
+
         self.user_id = user_id or "default_user"
         self.collection_name = collection_name or f"memory_store_{self.user_id}"
+
+        # 直接从环境变量读取最新配置，避免使用缓存的 config 对象
+        qdrant_host = os.getenv("MEM0_QDRANT_HOST", "localhost")
+        qdrant_port = os.getenv("MEM0_QDRANT_PORT", "6333")
+        qdrant_api_key = os.getenv("QDRANT_API_KEY", "")
+        neo4j_uri = os.getenv("MEM0_NEO4J_URI", "bolt://localhost:7687")
+        neo4j_user = os.getenv("MEM0_NEO4J_USER", "neo4j")
+        neo4j_password = os.getenv("MEM0_NEO4J_PASSWORD", "password123")
+        gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+        gemini_model = os.getenv("GEMINI_MODEL", "models/gemini-2.0-flash")
 
         # Build Qdrant config for local or cloud
         qdrant_config = {
@@ -247,14 +259,14 @@ class Mem0Base(MemoryInterface):
         }
 
         # For Qdrant Cloud, use url instead of host/port
-        if config.mem0.qdrant_api_key or config.mem0.qdrant_host.startswith("http"):
-            qdrant_config["url"] = config.mem0.qdrant_host
-            if config.mem0.qdrant_api_key:
-                qdrant_config["api_key"] = config.mem0.qdrant_api_key
+        if qdrant_api_key or qdrant_host.startswith("http"):
+            qdrant_config["url"] = qdrant_host
+            if qdrant_api_key:
+                qdrant_config["api_key"] = qdrant_api_key
         else:
             # Local Qdrant
-            qdrant_config["host"] = config.mem0.qdrant_host
-            qdrant_config["port"] = int(config.mem0.qdrant_port)
+            qdrant_config["host"] = qdrant_host
+            qdrant_config["port"] = int(qdrant_port)
 
         self._config = MemoryConfig(
             vector_store=VectorStoreConfig(
@@ -264,30 +276,30 @@ class Mem0Base(MemoryInterface):
             llm=LlmConfig(
                 provider="gemini",
                 config={
-                    "model": config.gemini.model,
-                    "api_key": config.gemini.api_key,
+                    "model": gemini_model,
+                    "api_key": gemini_api_key,
                 }
             ),
             embedder=EmbedderConfig(
                 provider="gemini",
                 config={
                     "model": "models/gemini-embedding-001",
-                    "api_key": config.gemini.api_key,
+                    "api_key": gemini_api_key,
                 }
             ),
             graph_store=GraphStoreConfig(
                 provider="neo4j",
                 config={
-                    "url": config.mem0.neo4j_uri,
-                    "username": config.mem0.neo4j_user,
-                    "password": config.mem0.neo4j_password,
+                    "url": neo4j_uri,
+                    "username": neo4j_user,
+                    "password": neo4j_password,
                     "database": "neo4j",  # Neo4j Aura 默认数据库名
                 },
                 llm=LlmConfig(
                     provider="gemini",
                     config={
-                        "model": config.gemini.model,
-                        "api_key": config.gemini.api_key,
+                        "model": gemini_model,
+                        "api_key": gemini_api_key,
                     }
                 ),
                 threshold=0.7,
