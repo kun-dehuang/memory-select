@@ -156,6 +156,34 @@ async def test_mem0_init() -> dict:
     """Test Mem0Graph initialization."""
     from core.mem0_wrapper import Mem0Graph
     import traceback
+    import os
+
+    result = {
+        "env_direct": {
+            "uri": os.getenv("MEM0_NEO4J_URI"),
+            "user": os.getenv("MEM0_NEO4J_USER"),
+            "password_length": len(os.getenv("MEM0_NEO4J_PASSWORD", "")),
+        },
+        "status": "unknown",
+        "error": None,
+        "traceback": None
+    }
+
+    try:
+        # Try to create a Mem0Graph instance
+        graph = Mem0Graph(user_id="test_debug_user")
+        result["status"] = "SUCCESS - Mem0Graph created"
+        result["note"] = "Instance created but connection not fully tested"
+    except Exception as e:
+        result["status"] = f"FAILED - {str(e)}"
+        result["error"] = str(e)
+        result["traceback"] = traceback.format_exc()
+
+    return result
+async def test_mem0_init() -> dict:
+    """Test Mem0Graph initialization."""
+    from core.mem0_wrapper import Mem0Graph
+    import traceback
 
     result = {
         "status": "unknown",
