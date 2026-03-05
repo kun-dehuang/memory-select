@@ -586,6 +586,43 @@ class Mem0Standard(Mem0Base):
 
         return search_results
 
+    def search_with_answer(
+        self,
+        query: str,
+        limit: int = 5,
+        uid: Optional[str] = None
+    ) -> dict:
+        """Search memories and generate LLM-enhanced answer (vector search only).
+
+        Args:
+            query: Search query text
+            limit: Max number of results
+            uid: Optional user ID filter
+
+        Returns:
+            Dictionary with:
+            - answer: LLM-generated answer
+            - memories: List of raw memory texts
+            - raw_results: Original SearchResult objects
+        """
+        from core.llm import get_llm_client
+
+        user_id = uid or self.user_id
+        search_results = self.search(query=query, limit=limit, uid=user_id)
+        memories = [r.content for r in search_results if r.content]
+
+        llm_client = get_llm_client()
+        answer = llm_client.generate_answer(
+            question=query,
+            memory_context=memories
+        )
+
+        return {
+            "answer": answer,
+            "memories": memories,
+            "raw_results": search_results
+        }
+
 
 class Mem0Graph(Mem0Base):
     """Mem0 Graph Memory - Vector + Graph search.

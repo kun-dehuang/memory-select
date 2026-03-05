@@ -55,6 +55,7 @@ class SystemResult:
     keyword_match_pct: float = 0.0
     entity_matches: list[str] = field(default_factory=list)
     entity_match_pct: float = 0.0
+    llm_answer: str = ""  # LLM-generated answer
 
 
 @dataclass
@@ -441,9 +442,25 @@ class MemoryTestRunner:
             )
 
         start_time = time.time()
+        llm_answer = ""
         try:
+            # Original search
             results = system.search(query=query, limit=limit, uid=self.user_id)
             duration_ms = (time.time() - start_time) * 1000
+
+            # Get LLM answer if the method is available
+            try:
+                answer_result = system.search_with_answer(
+                    query=query,
+                    limit=limit,
+                    uid=self.user_id
+                )
+                llm_answer = answer_result.get("answer", "")
+            except AttributeError:
+                # Method not available for this system
+                llm_answer = ""
+            except Exception as e:
+                llm_answer = f"[LLM 答案生成失败: {str(e)}]"
 
             # Check for graph relations
             has_relations = False
@@ -525,14 +542,16 @@ class MemoryTestRunner:
                 keyword_matches=keyword_matches,
                 keyword_match_pct=round(keyword_match_pct, 1),
                 entity_matches=list(set(entity_matches)),
-                entity_match_pct=round(entity_match_pct, 1)
+                entity_match_pct=round(entity_match_pct, 1),
+                llm_answer=llm_answer
             )
         except Exception as e:
             return SystemResult(
                 system_name=system_name,
                 results_count=0,
                 duration_ms=round((time.time() - start_time) * 1000, 2),
-                top_results=[{"error": str(e)}]
+                top_results=[{"error": str(e)}],
+                llm_answer=llm_answer
             )
 
     def run_test(self, test_case: TestCase) -> TestResult:
@@ -1000,14 +1019,16 @@ class MemoryTestRunner:
         self._save_text_table(txt_path)
 
     def _save_csv(self, path: str) -> None:
-        """Save results as CSV with actual search results - matching evaluate_test_queries.py format."""
+        """Save results as CSV with actual search results and LLM answers."""
         with open(path, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
 
-            # Header matching evaluate_test_queries.py format
+            # Header with LLM answer columns for each system
             headers = [
                 "评测方向", "query", "预期结果",
-                "mem0", "mem0g", "zep_graph"
+                "mem0", "mem0答案",
+                "mem0g", "mem0g答案",
+                "zep", "zep答案"
             ]
             writer.writerow(headers)
 
@@ -1026,8 +1047,10 @@ class MemoryTestRunner:
                         metadata_str = ", ".join([f"{k}={v}" for k, v in metadata.items()]) if metadata else ""
                         mem0_lines.append(f"[{i+1}] {content}\n    (score={score:.4f}, {metadata_str})")
                     mem0_value = "\n".join(mem0_lines)
+                    mem0_answer = mem0_std.llm_answer if mem0_std.llm_answer else "[无 LLM 答案]"
                 else:
                     mem0_value = "[无检索结果]"
+                    mem0_answer = ""
 
                 # Format mem0g result (with relations)
                 mem0_graph = result.system_results.get("mem0_graph")
@@ -1047,8 +1070,10 @@ class MemoryTestRunner:
 
                         mem0g_lines.append(f"[{i+1}] {content}\n    (score={score:.4f}, {metadata_str}{graph_info})")
                     mem0g_value = "\n".join(mem0g_lines)
+                    mem0g_answer = mem0_graph.llm_answer if mem0_graph.llm_answer else "[无 LLM 答案]"
                 else:
                     mem0g_value = "[无检索结果]"
+                    mem0g_answer = ""
 
                 # Format zep result
                 zep_result = result.system_results.get("zep_graph") or result.system_results.get("zep_memory")
@@ -1061,16 +1086,21 @@ class MemoryTestRunner:
                         metadata_str = ", ".join([f"{k}={v}" for k, v in metadata.items()]) if metadata else ""
                         zep_lines.append(f"[{i+1}] {content}\n    (score={score:.4f}, {metadata_str})")
                     zep_value = "\n".join(zep_lines)
+                    zep_answer = zep_result.llm_answer if zep_result.llm_answer else "[无 LLM 答案]"
                 else:
                     zep_value = "[无检索结果]"
+                    zep_answer = ""
 
                 row = [
                     tc.level,  # 评测方向 (使用 level)
                     tc.query,  # query
                     ", ".join(tc.expected_keywords[:3]) if tc.expected_keywords else "",  # 预期结果 (简化)
-                    mem0_value,  # mem0
-                    mem0g_value,  # mem0g
-                    zep_value   # zep_graph
+                    mem0_value,  # mem0 检索结果
+                    mem0_answer,  # mem0 LLM 答案
+                    mem0g_value,  # mem0g 检索结果
+                    mem0g_answer,  # mem0g LLM 答案
+                    zep_value,  # zep 检索结果
+                    zep_answer   # zep LLM 答案
                 ]
 
                 writer.writerow(row)
