@@ -4,6 +4,7 @@ nixPkgs = ["python311"]
 [phases.build]
 cmds = [
   "pip install --upgrade pip setuptools wheel",
+  "pip install --no-cache-dir git+https://github.com/kun-dehuang/mem0-code.git@main#egg=mem0ai",
   "pip install google-genai>=1.0.0",
   "pip install -r requirements.txt"
 ]

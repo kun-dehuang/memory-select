@@ -8,8 +8,8 @@ google-genai>=1.0.0
 
 # Mem0 - Production: 使用 GitHub fork 版本
 # 本地开发: cd /Users/myles/Projects/Pupixel/mem0-code && pip install -e .
-# Railway 部署: 自动从 GitHub 安装
-git+https://github.com/kun-dehuang/mem0-code.git@main#egg=mem0ai
+# Railway 部署: 通过 nixpacks.toml 安装（使用 --no-cache-dir 强制更新）
+# git+https://github.com/kun-dehuang/mem0-code.git@main#egg=mem0ai
 # 如果 fork 仓库有特定版本/分支，可以指定:
 # git+https://github.com/kun-dehuang/mem0-code.git@v0.1.80#egg=mem0ai
 qdrant-client>=1.12.0
