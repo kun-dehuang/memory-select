@@ -96,9 +96,6 @@ async def add_memory(request: AddMemoryRequest) -> AddMemoryResponse:
         add_duration_ms = (time.time() - add_start) * 1000
         duration_ms = (time.time() - start_time) * 1000
 
-        # Log timing breakdown
-        debug_logger.logger.info(f"[TIMING] add_memory: total={duration_ms:.0f}ms, mem0_add={add_duration_ms:.0f}ms")
-
         # Extract and log fact splits and entities/relations
         facts = []
         entities = []
@@ -140,7 +137,8 @@ async def add_memory(request: AddMemoryRequest) -> AddMemoryResponse:
         return AddMemoryResponse(
             success=True,
             memory_id=memory_id,
-            message="Memory added successfully"
+            message="Memory added successfully",
+            timings={"add": add_duration_ms}
         )
     except Exception as e:
         duration_ms = (time.time() - start_time) * 1000
@@ -157,6 +155,7 @@ async def add_memory(request: AddMemoryRequest) -> AddMemoryResponse:
 async def search_memory(request: SearchMemoryRequest) -> SearchMemoryResponse:
     """Search memories using both vector similarity and graph relationships."""
     try:
+        start_time = time.time()
         memory = get_memory_instance(request.uid) if request.uid else get_memory_instance("default_user")
         # Run the synchronous search in a thread pool
         results = await run_in_thread_pool(
@@ -180,7 +179,8 @@ async def search_memory(request: SearchMemoryRequest) -> SearchMemoryResponse:
         return SearchMemoryResponse(
             query=request.query,
             results=result_responses,
-            count=len(result_responses)
+            count=len(result_responses),
+            timings={"search": (time.time() - start_time) * 1000}
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
@@ -194,6 +194,7 @@ async def search_graph_only(request: SearchGraphOnlyRequest) -> SearchGraphOnlyR
     Useful for exploring relationships between entities.
     """
     try:
+        start_time = time.time()
         memory = get_memory_instance(request.uid) if request.uid else get_memory_instance("default_user")
         # Run the synchronous search_graph_only in a thread pool
         relations = await run_in_thread_pool(
@@ -206,7 +207,8 @@ async def search_graph_only(request: SearchGraphOnlyRequest) -> SearchGraphOnlyR
         return SearchGraphOnlyResponse(
             query=request.query,
             relations=relations,
-            count=len(relations)
+            count=len(relations),
+            timings={"search_graph": (time.time() - start_time) * 1000}
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Graph search failed: {str(e)}")
@@ -278,9 +280,11 @@ async def search_with_answer(request: SearchWithAnswerRequest) -> SearchWithAnsw
         ]
 
         duration_ms = (time.time() - start_time) * 1000
-
-        # Log timing breakdown
-        debug_logger.logger.info(f"[TIMING] search_with_answer: total={duration_ms:.0f}ms, search={search_duration_ms:.0f}ms")
+        timings = dict(result.get("timings", {}))
+        if "search" not in timings:
+            timings["search"] = search_duration_ms
+        if "total" not in timings:
+            timings["total"] = duration_ms
 
         # Log the API response
         debug_logger.log_api_response(
@@ -299,7 +303,8 @@ async def search_with_answer(request: SearchWithAnswerRequest) -> SearchWithAnsw
             answer=result.get("answer", ""),
             memories=result.get("memories", []),
             relations=relations,
-            raw_results=result_responses
+            raw_results=result_responses,
+            timings=timings
         )
     except Exception as e:
         duration_ms = (time.time() - start_time) * 1000

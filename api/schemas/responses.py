@@ -11,6 +11,7 @@ class AddMemoryResponse(BaseModel):
     success: bool
     memory_id: str
     message: Optional[str] = None
+    timings: dict[str, float]
 
 
 class SearchResultResponse(BaseModel):
@@ -27,6 +28,7 @@ class SearchMemoryResponse(BaseModel):
     query: str
     results: list[SearchResultResponse]
     count: int
+    timings: dict[str, float]
 
 
 class SearchWithAnswerResponse(BaseModel):
@@ -36,6 +38,7 @@ class SearchWithAnswerResponse(BaseModel):
     memories: list[str]
     relations: list[dict[str, str]]
     raw_results: list[SearchResultResponse]
+    timings: dict[str, float]
 
 
 class SearchGraphOnlyResponse(BaseModel):
@@ -43,6 +46,7 @@ class SearchGraphOnlyResponse(BaseModel):
     query: str
     relations: list[GraphSearchRelation]
     count: int
+    timings: dict[str, float]
 
 
 class GetGraphDataResponse(BaseModel):

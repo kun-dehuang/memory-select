@@ -356,9 +356,6 @@ class Mem0Base(MemoryInterface):
                     duration_ms=duration
                 )
 
-                # Log timing with clear format
-                _get_debug_logger().logger.info(f"[TIMING] add (mem0 client): {duration:.0f}ms")
-
                 if result and "results" in result:
                     memories = result["results"]
                     if memories:
@@ -564,9 +561,6 @@ class Mem0Standard(Mem0Base):
             duration_ms=duration
         )
 
-        # Log timing
-        _get_debug_logger().logger.info(f"[TIMING] search (Mem0Standard): {duration:.0f}ms")
-
         search_results = []
         if result and "results" in result:
             for item in result["results"]:
@@ -626,6 +620,7 @@ class Mem0Standard(Mem0Base):
         """
         from core.llm import get_llm_client
 
+        user_id = uid or self.user_id
         overall_start = time.time()
 
         search_results = self.search(query=query, limit=limit, uid=user_id)
@@ -644,16 +639,15 @@ class Mem0Standard(Mem0Base):
 
         total_time = (time.time() - overall_start) * 1000
 
-        # Log timing breakdown
-        _get_debug_logger().logger.info(
-            f"[TIMING] search_with_answer (Mem0Standard): total={total_time:.0f}ms, "
-            f"search={search_time:.0f}ms, llm={llm_time:.0f}ms"
-        )
-
         return {
             "answer": answer,
             "memories": memories,
-            "raw_results": search_results
+            "raw_results": search_results,
+            "timings": {
+                "search": search_time,
+                "llm": llm_time,
+                "total": total_time,
+            }
         }
 
 
@@ -696,9 +690,6 @@ class Mem0Graph(Mem0Base):
             limit=actual_limit
         )
         search_duration = (time.time() - search_start) * 1000
-
-        # Log timing
-        _get_debug_logger().logger.info(f"[TIMING] search (Mem0Graph): {search_duration:.0f}ms")
 
         search_results = []
 
@@ -781,17 +772,16 @@ class Mem0Graph(Mem0Base):
 
         total_time = (time.time() - overall_start) * 1000
 
-        # Log timing breakdown
-        _get_debug_logger().logger.info(
-            f"[TIMING] search_with_answer: total={total_time:.0f}ms, "
-            f"search={search_time:.0f}ms, llm={llm_time:.0f}ms"
-        )
-
         return {
             "answer": answer,
             "memories": memories,
             "relations": relations,
-            "raw_results": search_results
+            "raw_results": search_results,
+            "timings": {
+                "search": search_time,
+                "llm": llm_time,
+                "total": total_time,
+            }
         }
 
     def search_graph_only(self, query: str, limit: int = 5, uid: Optional[str] = None) -> list[GraphSearchRelation]:
