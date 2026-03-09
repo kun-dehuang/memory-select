@@ -11,6 +11,10 @@ from .zep_wrapper import (
     ZepGraph,
     ZepFactory,
 )
+from .remote_memory_client import (
+    RemoteMemoryClient,
+    RemoteMemoryFactory,
+)
 
 __all__ = [
     # Interface
@@ -23,4 +27,7 @@ __all__ = [
     "ZepMemory",
     "ZepGraph",
     "ZepFactory",
+    # Remote API
+    "RemoteMemoryClient",
+    "RemoteMemoryFactory",
 ]

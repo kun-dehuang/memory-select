@@ -13,6 +13,7 @@ Provides REST endpoints for memory operations including:
 import asyncio
 import time
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -39,6 +40,28 @@ router = APIRouter(prefix="/api/v1/memory", tags=["memory"])
 
 # Initialize debug logger for detailed logging
 debug_logger = get_debug_logger()
+
+# Create a thread pool executor for running synchronous operations
+# This helps prevent thread exhaustion in containerized environments
+_thread_pool: Optional[ThreadPoolExecutor] = None
+
+
+def get_thread_pool() -> ThreadPoolExecutor:
+    """Get or create the shared thread pool executor."""
+    global _thread_pool
+    if _thread_pool is None:
+        # Limit to 4 workers to avoid thread exhaustion in Railway
+        _thread_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mem_sync_")
+    return _thread_pool
+
+
+async def run_in_thread_pool(func, *args, **kwargs):
+    """Run a synchronous function in the thread pool."""
+    loop = asyncio.get_event_loop()
+    # Wrap the function with args and kwargs for run_in_executor
+    import functools
+    wrapped_func = functools.partial(func, *args, **kwargs)
+    return await loop.run_in_executor(get_thread_pool(), wrapped_func)
 
 
 @router.post("/add", response_model=AddMemoryResponse)
@@ -129,7 +152,9 @@ async def search_memory(request: SearchMemoryRequest) -> SearchMemoryResponse:
     """Search memories using both vector similarity and graph relationships."""
     try:
         memory = get_memory_instance(request.uid) if request.uid else get_memory_instance("default_user")
-        results = memory.search(
+        # Run the synchronous search in a thread pool
+        results = await run_in_thread_pool(
+            memory.search,
             query=request.query,
             limit=request.limit,
             uid=request.uid
@@ -164,7 +189,9 @@ async def search_graph_only(request: SearchGraphOnlyRequest) -> SearchGraphOnlyR
     """
     try:
         memory = get_memory_instance(request.uid) if request.uid else get_memory_instance("default_user")
-        relations = memory.search_graph_only(
+        # Run the synchronous search_graph_only in a thread pool
+        relations = await run_in_thread_pool(
+            memory.search_graph_only,
             query=request.query,
             limit=request.limit,
             uid=request.uid
@@ -202,7 +229,10 @@ async def search_with_answer(request: SearchWithAnswerRequest) -> SearchWithAnsw
         )
 
         memory = get_memory_instance(uid)
-        result = memory.search_with_answer(
+
+        # Run the synchronous search_with_answer in a thread pool to avoid thread issues
+        result = await run_in_thread_pool(
+            memory.search_with_answer,
             query=request.query,
             limit=request.limit,
             uid=uid
@@ -279,7 +309,11 @@ async def get_graph_data(uid: Optional[str] = Query(None, description="User ID f
     """
     try:
         memory = get_memory_instance(uid) if uid else get_memory_instance("default_user")
-        graph_data = memory.get_graph_data(uid=uid)
+        # Run the synchronous get_graph_data in a thread pool
+        graph_data = await run_in_thread_pool(
+            memory.get_graph_data,
+            uid=uid
+        )
 
         return GetGraphDataResponse(
             nodes=graph_data.nodes,
@@ -299,7 +333,8 @@ async def clear_memory(uid: str = Query(..., description="User ID to clear memor
     """
     try:
         memory = get_memory_instance(uid)
-        memory.clear()
+        # Run the synchronous clear in a thread pool
+        await run_in_thread_pool(memory.clear)
         return ClearMemoryResponse(
             success=True,
             message=f"All memories cleared for user: {uid}"
@@ -313,7 +348,8 @@ async def count_memory(uid: str = Query(..., description="User ID to count memor
     """Get the total count of stored memories for a user."""
     try:
         memory = get_memory_instance(uid)
-        count = memory.count()
+        # Run the synchronous count in a thread pool
+        count = await run_in_thread_pool(memory.count)
         return CountMemoryResponse(
             count=count,
             uid=uid

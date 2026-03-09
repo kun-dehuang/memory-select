@@ -47,6 +47,10 @@ class AppConfig:
     gemini: GeminiConfig = field(default_factory=GeminiConfig)
     mem0: Mem0Config = field(default_factory=Mem0Config)
     zep: ZepConfig = field(default_factory=ZepConfig)
+    remote_api_url: str = field(default_factory=lambda: os.getenv(
+        "REMOTE_API_URL",
+        "https://memory-select-production.up.railway.app"
+    ))
 
     @property
     def data_dir(self) -> str:
