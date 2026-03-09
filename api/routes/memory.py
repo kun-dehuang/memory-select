@@ -259,6 +259,8 @@ async def search_with_answer(
         instance_init_ms = (time.time() - instance_init_start) * 1000
         instance_init_breakdown = dict(getattr(memory, "_init_timings", {}))
         instance_init_breakdown.update(dict(getattr(memory, "_init_metadata", {})))
+        instance_init_breakdown.update(dict(getattr(memory, "_cache_info", {})))
+        instance_init_breakdown["instance_init_total"] = instance_init_ms
 
         # Run the synchronous search_with_answer in a thread pool to avoid thread issues
         result, thread_wait_ms = await run_in_thread_pool(

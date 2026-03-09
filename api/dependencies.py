@@ -1,14 +1,85 @@
 """FastAPI dependencies for dependency injection."""
 
-from typing import Annotated, Optional
+import os
+import threading
+import time
+from collections import OrderedDict
+from hashlib import sha256
+from typing import Annotated, Any, Optional
 
 from fastapi import Depends
 
 from core.mem0_wrapper import Mem0Graph
 
 
-# 使用简单的字典缓存，不使用 lru_cache 以避免配置更新后的问题
-_memory_instances: dict[str, Mem0Graph] = {}
+_CACHE_TTL_SECONDS = 30 * 60
+_CACHE_MAX_ENTRIES = 100
+_CACHE_KEY_SCOPE = "uid+collection+config"
+_CACHE_ENV_KEYS = (
+    "MEM0_QDRANT_HOST",
+    "MEM0_QDRANT_PORT",
+    "QDRANT_API_KEY",
+    "MEM0_NEO4J_URI",
+    "MEM0_NEO4J_USER",
+    "MEM0_NEO4J_PASSWORD",
+    "GEMINI_API_KEY",
+    "GEMINI_MODEL",
+)
+
+# 使用带元数据的有序缓存，支持 TTL 和容量淘汰
+_memory_instances: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_memory_instances_lock = threading.RLock()
+
+
+def _build_collection_name(uid: str) -> str:
+    return f"memory_store_{uid}"
+
+
+def _build_config_fingerprint() -> str:
+    raw = "|".join(f"{key}={os.getenv(key, '')}" for key in _CACHE_ENV_KEYS)
+    return sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _build_cache_key(uid: str, collection_name: str, config_fingerprint: str) -> str:
+    return f"{uid}|{collection_name}|{config_fingerprint}"
+
+
+def _close_memory_instance(instance: Mem0Graph) -> None:
+    for attr_name, close_method in (("_async_client", "aclose"), ("_async_client", "close"), ("_sync_client", "close")):
+        client = getattr(instance, attr_name, None)
+        if client is None:
+            continue
+        closer = getattr(client, close_method, None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:
+                pass
+
+
+def _evict_expired_locked(now: float) -> None:
+    expired_keys = [
+        cache_key
+        for cache_key, entry in _memory_instances.items()
+        if now - float(entry.get("last_used_at", now)) > _CACHE_TTL_SECONDS
+    ]
+    for cache_key in expired_keys:
+        entry = _memory_instances.pop(cache_key, None)
+        if entry:
+            _close_memory_instance(entry["instance"])
+
+
+def _evict_if_oversized_locked() -> None:
+    while len(_memory_instances) > _CACHE_MAX_ENTRIES:
+        _, entry = _memory_instances.popitem(last=False)
+        _close_memory_instance(entry["instance"])
+
+
+def clear_memory_instance_cache() -> None:
+    with _memory_instances_lock:
+        while _memory_instances:
+            _, entry = _memory_instances.popitem(last=False)
+            _close_memory_instance(entry["instance"])
 
 
 def get_memory_instance(uid: str) -> Mem0Graph:
@@ -20,9 +91,47 @@ def get_memory_instance(uid: str) -> Mem0Graph:
     Returns:
         Mem0Graph instance
     """
-    # 每次创建新实例以确保使用最新配置
-    # Mem0Graph 内部已处理 user_id 隔离，缓存不是必需的
-    return Mem0Graph(user_id=uid)
+    now = time.time()
+    collection_name = _build_collection_name(uid)
+    config_fingerprint = _build_config_fingerprint()
+    cache_key = _build_cache_key(uid, collection_name, config_fingerprint)
+    cache_lookup_start = time.time()
+
+    with _memory_instances_lock:
+        _evict_expired_locked(now)
+
+        entry = _memory_instances.get(cache_key)
+        if entry is not None:
+            entry["last_used_at"] = now
+            _memory_instances.move_to_end(cache_key)
+            instance = entry["instance"]
+            instance._cache_info = {
+                "cache_hit": True,
+                "cache_age_ms": max(0.0, (now - float(entry["created_at"])) * 1000),
+                "cache_lookup": (time.time() - cache_lookup_start) * 1000,
+                "cache_key_scope": _CACHE_KEY_SCOPE,
+            }
+            return instance
+
+        instance = Mem0Graph(user_id=uid, collection_name=collection_name)
+        created_at = time.time()
+        _memory_instances[cache_key] = {
+            "instance": instance,
+            "created_at": created_at,
+            "last_used_at": created_at,
+            "config_fingerprint": config_fingerprint,
+            "collection_name": collection_name,
+        }
+        _memory_instances.move_to_end(cache_key)
+        _evict_if_oversized_locked()
+
+    instance._cache_info = {
+        "cache_hit": False,
+        "cache_age_ms": 0.0,
+        "cache_lookup": (time.time() - cache_lookup_start) * 1000,
+        "cache_key_scope": _CACHE_KEY_SCOPE,
+    }
+    return instance
 
 
 async def get_memory_for_request(uid: Optional[str] = None) -> Optional[Mem0Graph]:

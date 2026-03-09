@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.routes import memory_router, logs_router
+from api.dependencies import clear_memory_instance_cache
 from api.middleware import APILoggingMiddleware
 from api.schemas.openai_functions import OPENAI_FUNCTIONS_SCHEMA
 from api.schemas.responses import HealthResponse, OpenAIFunctionsResponse
@@ -25,6 +26,7 @@ async def lifespan(app: FastAPI):
     # Startup
     yield
     # Shutdown
+    clear_memory_instance_cache()
 
 
 app = FastAPI(
