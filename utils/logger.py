@@ -310,7 +310,8 @@ class DebugLogger:
         if uid:
             self.logger.info(f"  User: {uid}")
         if request_data:
-            self.logger.debug(f"  Request: {json.dumps(request_data, ensure_ascii=False, indent=2)}")
+            # Log request body at INFO level to show in console
+            self.logger.info(f"  Request: {json.dumps(request_data, ensure_ascii=False, indent=2)}")
 
         self._store_log(log_entry)
 
@@ -366,7 +367,7 @@ class DebugLogger:
             relations: List of extracted relations (from graph)
         """
         self.logger.info("[FACT SPLIT]")
-        self.logger.debug(f"  Input: {text}")
+        self.logger.info(f"  Input: {text}")
 
         if facts:
             self.logger.info(f"  Facts extracted: {len(facts)}")
