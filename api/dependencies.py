@@ -29,6 +29,7 @@ _CACHE_ENV_KEYS = (
 # 使用带元数据的有序缓存，支持 TTL 和容量淘汰
 _memory_instances: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 _memory_instances_lock = threading.RLock()
+_instance_creation_locks: dict[str, threading.Lock] = {}
 
 
 def _build_collection_name(uid: str) -> str:
@@ -67,12 +68,14 @@ def _evict_expired_locked(now: float) -> None:
         entry = _memory_instances.pop(cache_key, None)
         if entry:
             _close_memory_instance(entry["instance"])
+        _instance_creation_locks.pop(cache_key, None)
 
 
 def _evict_if_oversized_locked() -> None:
     while len(_memory_instances) > _CACHE_MAX_ENTRIES:
-        _, entry = _memory_instances.popitem(last=False)
+        cache_key, entry = _memory_instances.popitem(last=False)
         _close_memory_instance(entry["instance"])
+        _instance_creation_locks.pop(cache_key, None)
 
 
 def clear_memory_instance_cache() -> None:
@@ -80,6 +83,25 @@ def clear_memory_instance_cache() -> None:
         while _memory_instances:
             _, entry = _memory_instances.popitem(last=False)
             _close_memory_instance(entry["instance"])
+        _instance_creation_locks.clear()
+
+
+def _build_cache_info(
+    *,
+    cache_hit: bool,
+    cache_age_ms: float,
+    cache_lookup_start: float,
+    lock_wait_ms: float,
+    cache_state: str,
+) -> dict[str, Any]:
+    return {
+        "cache_hit": cache_hit,
+        "cache_age_ms": cache_age_ms,
+        "cache_lookup": (time.time() - cache_lookup_start) * 1000,
+        "lock_wait_ms": lock_wait_ms,
+        "cache_state": cache_state,
+        "cache_key_scope": _CACHE_KEY_SCOPE,
+    }
 
 
 def get_memory_instance(uid: str) -> Mem0Graph:
@@ -105,32 +127,62 @@ def get_memory_instance(uid: str) -> Mem0Graph:
             entry["last_used_at"] = now
             _memory_instances.move_to_end(cache_key)
             instance = entry["instance"]
-            instance._cache_info = {
-                "cache_hit": True,
-                "cache_age_ms": max(0.0, (now - float(entry["created_at"])) * 1000),
-                "cache_lookup": (time.time() - cache_lookup_start) * 1000,
-                "cache_key_scope": _CACHE_KEY_SCOPE,
-            }
+            instance._cache_info = _build_cache_info(
+                cache_hit=True,
+                cache_age_ms=max(0.0, (now - float(entry["created_at"])) * 1000),
+                cache_lookup_start=cache_lookup_start,
+                lock_wait_ms=0.0,
+                cache_state="hit",
+            )
             return instance
+
+        creation_lock = _instance_creation_locks.get(cache_key)
+        if creation_lock is None:
+            creation_lock = threading.Lock()
+            _instance_creation_locks[cache_key] = creation_lock
+
+    wait_start = time.time()
+    with creation_lock:
+        lock_wait_ms = (time.time() - wait_start) * 1000
+
+        with _memory_instances_lock:
+            now = time.time()
+            _evict_expired_locked(now)
+            entry = _memory_instances.get(cache_key)
+            if entry is not None:
+                entry["last_used_at"] = now
+                _memory_instances.move_to_end(cache_key)
+                instance = entry["instance"]
+                instance._cache_info = _build_cache_info(
+                    cache_hit=True,
+                    cache_age_ms=max(0.0, (now - float(entry["created_at"])) * 1000),
+                    cache_lookup_start=cache_lookup_start,
+                    lock_wait_ms=lock_wait_ms,
+                    cache_state="miss_reused_after_wait" if lock_wait_ms > 0 else "hit",
+                )
+                return instance
 
         instance = Mem0Graph(user_id=uid, collection_name=collection_name)
         created_at = time.time()
-        _memory_instances[cache_key] = {
-            "instance": instance,
-            "created_at": created_at,
-            "last_used_at": created_at,
-            "config_fingerprint": config_fingerprint,
-            "collection_name": collection_name,
-        }
-        _memory_instances.move_to_end(cache_key)
-        _evict_if_oversized_locked()
 
-    instance._cache_info = {
-        "cache_hit": False,
-        "cache_age_ms": 0.0,
-        "cache_lookup": (time.time() - cache_lookup_start) * 1000,
-        "cache_key_scope": _CACHE_KEY_SCOPE,
-    }
+        with _memory_instances_lock:
+            _memory_instances[cache_key] = {
+                "instance": instance,
+                "created_at": created_at,
+                "last_used_at": created_at,
+                "config_fingerprint": config_fingerprint,
+                "collection_name": collection_name,
+            }
+            _memory_instances.move_to_end(cache_key)
+            _evict_if_oversized_locked()
+
+    instance._cache_info = _build_cache_info(
+        cache_hit=False,
+        cache_age_ms=0.0,
+        cache_lookup_start=cache_lookup_start,
+        lock_wait_ms=lock_wait_ms,
+        cache_state="miss_created",
+    )
     return instance
 
 
