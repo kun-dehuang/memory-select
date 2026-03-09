@@ -646,7 +646,7 @@ class Mem0Standard(Mem0Base):
             "timings": {
                 "search": search_time,
                 "llm": llm_time,
-                "total": total_time,
+                "core_total": total_time,
             }
         }
 
@@ -780,7 +780,7 @@ class Mem0Graph(Mem0Base):
             "timings": {
                 "search": search_time,
                 "llm": llm_time,
-                "total": total_time,
+                "core_total": total_time,
             }
         }
 

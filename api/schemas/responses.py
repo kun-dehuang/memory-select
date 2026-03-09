@@ -38,7 +38,7 @@ class SearchWithAnswerResponse(BaseModel):
     memories: list[str]
     relations: list[dict[str, str]]
     raw_results: list[SearchResultResponse]
-    timings: dict[str, float]
+    timings: dict[str, Any]
 
 
 class SearchGraphOnlyResponse(BaseModel):

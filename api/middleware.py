@@ -36,6 +36,7 @@ class APILoggingMiddleware(BaseHTTPMiddleware):
             The response from the route handler
         """
         start_time = time.time()
+        request.state.request_start_time = start_time
         endpoint = str(request.url.path)
         method = request.method
 

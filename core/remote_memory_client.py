@@ -158,6 +158,7 @@ class RemoteMemoryClient:
         """
         from models import SearchResult, GraphSearchRelation
 
+        start_time = time.time()
         response = self.client.post(
             f"{self.base_url}/api/v1/memory/search-with-answer",
             json={
@@ -168,6 +169,19 @@ class RemoteMemoryClient:
         )
         response.raise_for_status()
         data = response.json()
+        round_trip_ms = (time.time() - start_time) * 1000
+
+        timings = data.get("timings", {}) or {}
+        server_timings = dict(timings.get("server", {}))
+        client_timings = dict(timings.get("client", {}))
+        client_timings["round_trip"] = round_trip_ms
+        request_total_ms = server_timings.get("request_total")
+        if isinstance(request_total_ms, (int, float)):
+            client_timings["network_overhead"] = max(0.0, round_trip_ms - float(request_total_ms))
+        timings = {
+            "server": server_timings,
+            "client": client_timings,
+        }
 
         # Convert raw_results to SearchResult objects
         raw_results = []
@@ -187,7 +201,8 @@ class RemoteMemoryClient:
             "answer": data.get("answer", ""),
             "memories": data.get("memories", []),
             "relations": data.get("relations", []),
-            "raw_results": raw_results
+            "raw_results": raw_results,
+            "timings": timings,
         }
 
     def search_graph_only(

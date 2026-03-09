@@ -659,13 +659,34 @@ def display_search_results(query: str, results: list[SearchResult], latency: flo
 def display_search_with_answer_results(query: str, result: dict, latency: float):
     """Display search results with AI-generated answer."""
     st.markdown("---")
+    timings = result.get("timings", {}) or {}
+    server_timings = timings.get("server", {}) or {}
+    client_timings = timings.get("client", {}) or {}
+    displayed_latency = client_timings.get("round_trip", latency)
 
     # Query summary
     col1, col2 = st.columns([3, 1])
     with col1:
         st.markdown(f"### 📝 Query: \"{query}\"")
     with col2:
-        st.markdown(f"<div style='text-align: right;'>{latency:.1f}ms</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='text-align: right;'>{displayed_latency:.1f}ms</div>", unsafe_allow_html=True)
+
+    timing_metrics = [
+        ("客户端总耗时", client_timings.get("round_trip")),
+        ("服务端总耗时", server_timings.get("request_total")),
+        ("实例初始化", server_timings.get("instance_init")),
+        ("线程等待", server_timings.get("thread_wait")),
+        ("Search", server_timings.get("search")),
+        ("LLM", server_timings.get("llm")),
+        ("网络/客户端开销", client_timings.get("network_overhead")),
+    ]
+    metric_columns = st.columns(len(timing_metrics))
+    for col, (label, value) in zip(metric_columns, timing_metrics):
+        with col:
+            if isinstance(value, (int, float)):
+                st.metric(label, f"{value:.1f}ms")
+            else:
+                st.metric(label, "N/A")
 
     # AI Answer
     answer = result.get("answer", "")

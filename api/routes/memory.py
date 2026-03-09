@@ -15,7 +15,7 @@ import time
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from api.dependencies import get_memory_instance
 from utils.logger import get_debug_logger
@@ -57,11 +57,20 @@ def get_thread_pool() -> ThreadPoolExecutor:
 
 async def run_in_thread_pool(func, *args, **kwargs):
     """Run a synchronous function in the thread pool."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     # Wrap the function with args and kwargs for run_in_executor
     import functools
-    wrapped_func = functools.partial(func, *args, **kwargs)
-    return await loop.run_in_executor(get_thread_pool(), wrapped_func)
+    submitted_at = time.time()
+    execution_info: dict[str, float] = {}
+
+    def wrapped_with_timing():
+        execution_info["started_at"] = time.time()
+        return func(*args, **kwargs)
+
+    wrapped_func = functools.partial(wrapped_with_timing)
+    result = await loop.run_in_executor(get_thread_pool(), wrapped_func)
+    thread_wait_ms = max(0.0, (execution_info.get("started_at", submitted_at) - submitted_at) * 1000)
+    return result, thread_wait_ms
 
 
 @router.post("/add", response_model=AddMemoryResponse)
@@ -158,7 +167,7 @@ async def search_memory(request: SearchMemoryRequest) -> SearchMemoryResponse:
         start_time = time.time()
         memory = get_memory_instance(request.uid) if request.uid else get_memory_instance("default_user")
         # Run the synchronous search in a thread pool
-        results = await run_in_thread_pool(
+        results, _thread_wait_ms = await run_in_thread_pool(
             memory.search,
             query=request.query,
             limit=request.limit,
@@ -197,7 +206,7 @@ async def search_graph_only(request: SearchGraphOnlyRequest) -> SearchGraphOnlyR
         start_time = time.time()
         memory = get_memory_instance(request.uid) if request.uid else get_memory_instance("default_user")
         # Run the synchronous search_graph_only in a thread pool
-        relations = await run_in_thread_pool(
+        relations, _thread_wait_ms = await run_in_thread_pool(
             memory.search_graph_only,
             query=request.query,
             limit=request.limit,
@@ -215,7 +224,10 @@ async def search_graph_only(request: SearchGraphOnlyRequest) -> SearchGraphOnlyR
 
 
 @router.post("/search-with-answer", response_model=SearchWithAnswerResponse)
-async def search_with_answer(request: SearchWithAnswerRequest) -> SearchWithAnswerResponse:
+async def search_with_answer(
+    request: SearchWithAnswerRequest,
+    raw_request: Request
+) -> SearchWithAnswerResponse:
     """Search memories and generate an AI-powered answer.
 
     Combines vector search, graph relationships, and LLM to generate
@@ -236,18 +248,19 @@ async def search_with_answer(request: SearchWithAnswerRequest) -> SearchWithAnsw
             }
         )
 
+        instance_init_start = time.time()
         memory = get_memory_instance(uid)
+        instance_init_ms = (time.time() - instance_init_start) * 1000
 
         # Run the synchronous search_with_answer in a thread pool to avoid thread issues
-        search_start = time.time()
-        result = await run_in_thread_pool(
+        result, thread_wait_ms = await run_in_thread_pool(
             memory.search_with_answer,
             query=request.query,
             limit=request.limit,
             uid=uid
         )
-        search_duration_ms = (time.time() - search_start) * 1000
 
+        postprocess_start = time.time()
         # Extract raw results and relations for logging
         raw_results = result.get("raw_results", [])
         relations = result.get("relations", [])
@@ -278,13 +291,27 @@ async def search_with_answer(request: SearchWithAnswerRequest) -> SearchWithAnsw
             )
             for r in raw_results
         ]
+        postprocess_ms = (time.time() - postprocess_start) * 1000
 
-        duration_ms = (time.time() - start_time) * 1000
-        timings = dict(result.get("timings", {}))
-        if "search" not in timings:
-            timings["search"] = search_duration_ms
-        if "total" not in timings:
-            timings["total"] = duration_ms
+        route_total_ms = (time.time() - start_time) * 1000
+        request_start_time = getattr(raw_request.state, "request_start_time", start_time)
+        request_total_ms = (time.time() - request_start_time) * 1000
+
+        core_timings = dict(result.get("timings", {}))
+        server_timings = {
+            "instance_init": instance_init_ms,
+            "thread_wait": thread_wait_ms,
+            "search": float(core_timings.get("search", 0.0)),
+            "llm": float(core_timings.get("llm", 0.0)),
+            "core_total": float(core_timings.get("core_total", 0.0)),
+            "postprocess": postprocess_ms,
+            "route_total": route_total_ms,
+            "request_total": request_total_ms,
+        }
+        timings = {
+            "server": server_timings,
+            "client": {},
+        }
 
         # Log the API response
         debug_logger.log_api_response(
