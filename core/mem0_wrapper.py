@@ -239,10 +239,15 @@ class Mem0Base(MemoryInterface):
         """
         import os
 
+        init_start = time.time()
+        self._init_timings: dict[str, float] = {}
+        self._init_metadata: dict[str, Any] = {}
+
         self.user_id = user_id or "default_user"
         self.collection_name = collection_name or f"memory_store_{self.user_id}"
 
         # 直接从环境变量读取最新配置，避免使用缓存的 config 对象
+        env_read_start = time.time()
         qdrant_host = os.getenv("MEM0_QDRANT_HOST", "localhost")
         qdrant_port = os.getenv("MEM0_QDRANT_PORT", "6333")
         qdrant_api_key = os.getenv("QDRANT_API_KEY", "")
@@ -251,8 +256,10 @@ class Mem0Base(MemoryInterface):
         neo4j_password = os.getenv("MEM0_NEO4J_PASSWORD", "password123")
         gemini_api_key = os.getenv("GEMINI_API_KEY", "")
         gemini_model = os.getenv("GEMINI_MODEL", "models/gemini-2.0-flash")
+        self._init_timings["env_read"] = (time.time() - env_read_start) * 1000
 
         # Build Qdrant config for local or cloud
+        qdrant_config_start = time.time()
         qdrant_config = {
             "collection_name": self.collection_name,
             "embedding_model_dims": 768,
@@ -267,7 +274,12 @@ class Mem0Base(MemoryInterface):
             # Local Qdrant
             qdrant_config["host"] = qdrant_host
             qdrant_config["port"] = int(qdrant_port)
+        self._init_timings["qdrant_config_build"] = (time.time() - qdrant_config_start) * 1000
+        self._init_metadata["qdrant_mode"] = "cloud" if qdrant_api_key or qdrant_host.startswith("http") else "local"
+        self._init_metadata["neo4j_enabled"] = bool(neo4j_uri and neo4j_user)
+        self._init_metadata["collection_name"] = self.collection_name
 
+        memory_config_start = time.time()
         self._config = MemoryConfig(
             vector_store=VectorStoreConfig(
                 provider="qdrant",
@@ -306,9 +318,16 @@ class Mem0Base(MemoryInterface):
             ),
             #custom_fact_extraction_prompt=fact_extraction_prompt,
         )
+        self._init_timings["memory_config_build"] = (time.time() - memory_config_start) * 1000
 
+        async_client_start = time.time()
         self._async_client = AsyncMemory(self._config)
+        self._init_timings["async_client_init"] = (time.time() - async_client_start) * 1000
+
+        sync_client_start = time.time()
         self._sync_client = Memory(self._config)
+        self._init_timings["sync_client_init"] = (time.time() - sync_client_start) * 1000
+        self._init_timings["instance_init_total"] = (time.time() - init_start) * 1000
 
     async def add(self, uid: str, text: str, metadata: dict) -> str:
         """Add a memory using mem0 with graph extraction (async).

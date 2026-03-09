@@ -257,6 +257,8 @@ async def search_with_answer(
         instance_init_start = time.time()
         memory = get_memory_instance(uid)
         instance_init_ms = (time.time() - instance_init_start) * 1000
+        instance_init_breakdown = dict(getattr(memory, "_init_timings", {}))
+        instance_init_breakdown.update(dict(getattr(memory, "_init_metadata", {})))
 
         # Run the synchronous search_with_answer in a thread pool to avoid thread issues
         result, thread_wait_ms = await run_in_thread_pool(
@@ -307,6 +309,7 @@ async def search_with_answer(
         core_timings = dict(result.get("timings", {}))
         server_timings = {
             "instance_init": instance_init_ms,
+            "instance_init_breakdown": instance_init_breakdown,
             "thread_wait": thread_wait_ms,
             "search": float(core_timings.get("search", 0.0)),
             "llm": float(core_timings.get("llm", 0.0)),
