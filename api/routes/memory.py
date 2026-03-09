@@ -98,6 +98,7 @@ async def add_memory(request: AddMemoryRequest) -> AddMemoryResponse:
         facts = []
         entities = []
         relations = []
+        memory_id = ""
 
         if result and "results" in result and result["results"]:
             memory_data = result["results"][0]
