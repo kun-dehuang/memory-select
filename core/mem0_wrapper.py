@@ -356,6 +356,9 @@ class Mem0Base(MemoryInterface):
                     duration_ms=duration
                 )
 
+                # Log timing with clear format
+                _get_debug_logger().logger.info(f"[TIMING] add (mem0 client): {duration:.0f}ms")
+
                 if result and "results" in result:
                     memories = result["results"]
                     if memories:
@@ -561,6 +564,9 @@ class Mem0Standard(Mem0Base):
             duration_ms=duration
         )
 
+        # Log timing
+        _get_debug_logger().logger.info(f"[TIMING] search (Mem0Standard): {duration:.0f}ms")
+
         search_results = []
         if result and "results" in result:
             for item in result["results"]:
@@ -620,14 +626,28 @@ class Mem0Standard(Mem0Base):
         """
         from core.llm import get_llm_client
 
-        user_id = uid or self.user_id
+        overall_start = time.time()
+
         search_results = self.search(query=query, limit=limit, uid=user_id)
+        search_time = (time.time() - overall_start) * 1000
+
         memories = [r.content for r in search_results if r.content]
 
         llm_client = get_llm_client()
+
+        llm_start = time.time()
         answer = llm_client.generate_answer(
             question=query,
             memory_context=memories
+        )
+        llm_time = (time.time() - llm_start) * 1000
+
+        total_time = (time.time() - overall_start) * 1000
+
+        # Log timing breakdown
+        _get_debug_logger().logger.info(
+            f"[TIMING] search_with_answer (Mem0Standard): total={total_time:.0f}ms, "
+            f"search={search_time:.0f}ms, llm={llm_time:.0f}ms"
         )
 
         return {
@@ -669,11 +689,16 @@ class Mem0Graph(Mem0Base):
 
         _get_debug_logger().logger.info(f"[SEARCH] Mem0Graph - query: '{query}', user_id: {user_id}, limit: {actual_limit}")
 
+        search_start = time.time()
         result = self._sync_client.search(
             query=query,
             user_id=user_id,
             limit=actual_limit
         )
+        search_duration = (time.time() - search_start) * 1000
+
+        # Log timing
+        _get_debug_logger().logger.info(f"[TIMING] search (Mem0Graph): {search_duration:.0f}ms")
 
         search_results = []
 
@@ -730,7 +755,10 @@ class Mem0Graph(Mem0Base):
 
         user_id = uid or self.user_id
 
+        overall_start = time.time()
+
         search_results = self.search(query=query, limit=limit, uid=user_id)
+        search_time = (time.time() - overall_start) * 1000
 
         memories = [r.content for r in search_results if r.content]
 
@@ -742,10 +770,21 @@ class Mem0Graph(Mem0Base):
             ]
 
         llm_client = get_llm_client()
+
+        llm_start = time.time()
         answer = llm_client.generate_graph_enhanced_answer(
             question=query,
             memories=memories,
             relations=relations
+        )
+        llm_time = (time.time() - llm_start) * 1000
+
+        total_time = (time.time() - overall_start) * 1000
+
+        # Log timing breakdown
+        _get_debug_logger().logger.info(
+            f"[TIMING] search_with_answer: total={total_time:.0f}ms, "
+            f"search={search_time:.0f}ms, llm={llm_time:.0f}ms"
         )
 
         return {

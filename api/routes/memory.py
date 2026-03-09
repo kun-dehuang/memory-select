@@ -87,12 +87,17 @@ async def add_memory(request: AddMemoryRequest) -> AddMemoryResponse:
         )
 
         # Get the underlying mem0 client to capture detailed response
+        add_start = time.time()
         result = await memory._async_client.add(
             messages=[{"role": "user", "content": request.text}],
             user_id=request.uid,
             metadata=request.metadata or {}
         )
+        add_duration_ms = (time.time() - add_start) * 1000
         duration_ms = (time.time() - start_time) * 1000
+
+        # Log timing breakdown
+        debug_logger.logger.info(f"[TIMING] add_memory: total={duration_ms:.0f}ms, mem0_add={add_duration_ms:.0f}ms")
 
         # Extract and log fact splits and entities/relations
         facts = []
@@ -232,12 +237,14 @@ async def search_with_answer(request: SearchWithAnswerRequest) -> SearchWithAnsw
         memory = get_memory_instance(uid)
 
         # Run the synchronous search_with_answer in a thread pool to avoid thread issues
+        search_start = time.time()
         result = await run_in_thread_pool(
             memory.search_with_answer,
             query=request.query,
             limit=request.limit,
             uid=uid
         )
+        search_duration_ms = (time.time() - search_start) * 1000
 
         # Extract raw results and relations for logging
         raw_results = result.get("raw_results", [])
@@ -271,6 +278,9 @@ async def search_with_answer(request: SearchWithAnswerRequest) -> SearchWithAnsw
         ]
 
         duration_ms = (time.time() - start_time) * 1000
+
+        # Log timing breakdown
+        debug_logger.logger.info(f"[TIMING] search_with_answer: total={duration_ms:.0f}ms, search={search_duration_ms:.0f}ms")
 
         # Log the API response
         debug_logger.log_api_response(
