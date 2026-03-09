@@ -440,11 +440,12 @@ def import_data(records: list[dict], uid: str, show_progress: bool, verify: bool
         st.error("❌ No records to import")
         return
 
-    # Create client
+    # Create client with extended timeout for LLM operations
     try:
         st.session_state.remote_client = RemoteMemoryFactory.create(
             base_url=config.remote_api_url,
-            user_id=uid
+            user_id=uid,
+            timeout=180.0  # 3 minutes for search-with-answer with LLM
         )
         st.session_state.current_uid = uid
     except Exception as e:

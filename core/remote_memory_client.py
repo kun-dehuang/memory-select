@@ -31,7 +31,14 @@ class RemoteMemoryClient:
     def client(self) -> httpx.Client:
         """Get or create HTTP client."""
         if self._client is None:
-            self._client = httpx.Client(timeout=self.timeout)
+            # Use separate timeouts: connect (fast), read (slow for LLM)
+            timeout_config = httpx.Timeout(
+                connect=10.0,      # 10s to establish connection
+                read=self.timeout,  # Full timeout for reading response (LLLM can take time)
+                write=10.0,        # 10s to send request
+                pool=5.0           # 5s to get connection from pool
+            )
+            self._client = httpx.Client(timeout=timeout_config)
         return self._client
 
     def close(self):
@@ -291,12 +298,13 @@ class RemoteMemoryFactory:
     """Factory for creating remote memory clients."""
 
     @staticmethod
-    def create(base_url: Optional[str] = None, user_id: str = "default") -> RemoteMemoryClient:
+    def create(base_url: Optional[str] = None, user_id: str = "default", timeout: float = 120.0) -> RemoteMemoryClient:
         """Create a remote memory client.
 
         Args:
             base_url: Base URL of the remote API (uses config if not provided)
             user_id: User ID (for session tracking, not used for API calls)
+            timeout: Request timeout in seconds (default: 120)
 
         Returns:
             RemoteMemoryClient instance
@@ -305,4 +313,4 @@ class RemoteMemoryFactory:
             from config import config
             base_url = config.remote_api_url
 
-        return RemoteMemoryClient(base_url=base_url)
+        return RemoteMemoryClient(base_url=base_url, timeout=timeout)
