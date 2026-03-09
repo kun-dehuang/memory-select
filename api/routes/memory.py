@@ -55,8 +55,12 @@ def get_thread_pool() -> ThreadPoolExecutor:
     return _thread_pool
 
 
-async def run_in_thread_pool(func, *args, **kwargs):
-    """Run a synchronous function in the thread pool."""
+async def run_in_thread_pool(func, *args, with_wait_time: bool = False, **kwargs):
+    """Run a synchronous function in the thread pool.
+
+    By default this preserves the original behavior and returns only the
+    function result. Callers can opt in to thread wait timing when needed.
+    """
     loop = asyncio.get_running_loop()
     # Wrap the function with args and kwargs for run_in_executor
     import functools
@@ -70,7 +74,9 @@ async def run_in_thread_pool(func, *args, **kwargs):
     wrapped_func = functools.partial(wrapped_with_timing)
     result = await loop.run_in_executor(get_thread_pool(), wrapped_func)
     thread_wait_ms = max(0.0, (execution_info.get("started_at", submitted_at) - submitted_at) * 1000)
-    return result, thread_wait_ms
+    if with_wait_time:
+        return result, thread_wait_ms
+    return result
 
 
 @router.post("/add", response_model=AddMemoryResponse)
@@ -167,7 +173,7 @@ async def search_memory(request: SearchMemoryRequest) -> SearchMemoryResponse:
         start_time = time.time()
         memory = get_memory_instance(request.uid) if request.uid else get_memory_instance("default_user")
         # Run the synchronous search in a thread pool
-        results, _thread_wait_ms = await run_in_thread_pool(
+        results = await run_in_thread_pool(
             memory.search,
             query=request.query,
             limit=request.limit,
@@ -206,7 +212,7 @@ async def search_graph_only(request: SearchGraphOnlyRequest) -> SearchGraphOnlyR
         start_time = time.time()
         memory = get_memory_instance(request.uid) if request.uid else get_memory_instance("default_user")
         # Run the synchronous search_graph_only in a thread pool
-        relations, _thread_wait_ms = await run_in_thread_pool(
+        relations = await run_in_thread_pool(
             memory.search_graph_only,
             query=request.query,
             limit=request.limit,
@@ -255,6 +261,7 @@ async def search_with_answer(
         # Run the synchronous search_with_answer in a thread pool to avoid thread issues
         result, thread_wait_ms = await run_in_thread_pool(
             memory.search_with_answer,
+            with_wait_time=True,
             query=request.query,
             limit=request.limit,
             uid=uid
@@ -322,7 +329,7 @@ async def search_with_answer(
                 "relations_count": len(relations),
                 "answer_length": len(result.get("answer", ""))
             },
-            duration_ms=duration_ms
+            duration_ms=request_total_ms
         )
 
         return SearchWithAnswerResponse(
