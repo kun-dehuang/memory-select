@@ -168,6 +168,28 @@ curl -X POST https://your-app.up.railway.app/api/v1/memory/search \
 
 ---
 
+## 升级验证流程
+
+当 `requirements.txt` 中的 mem0 依赖跟随 fork 的 `main` 分支时，升级后至少做以下验证：
+
+1. 重新安装依赖：
+   - 本地：`pip install -r requirements.txt`
+   - Railway：重新部署并检查构建日志，确认安装源为 `git+https://github.com/kun-dehuang/mem0-code.git@main#egg=mem0ai`
+2. 启动 API：`uvicorn api.main:app --reload`
+3. 验证主链路：
+   - `POST /api/v1/memory/search-with-answer`
+   - 确认 mem0 正常导入，缓存和 `timings` 结构正常返回
+4. 验证图相关能力：
+   - `POST /api/v1/memory/search-graph`
+   - `GET /api/v1/memory/graph`
+5. 验证数据库连接：
+   - `GET /api/v1/config/test-neo4j`
+   - 如有需要，再验证实际 Qdrant 检索链路
+
+如果升级后出现问题，优先检查 fork 的 `main` 最近提交和 Railway 构建日志，再决定是否回退到更稳定的 tag 或 commit。
+
+---
+
 ## 费用估算
 
 | 服务 | 免费额度 | 超出后费用 |
