@@ -55,6 +55,15 @@ def get_thread_pool() -> ThreadPoolExecutor:
     return _thread_pool
 
 
+def shutdown_thread_pool() -> None:
+    """Shutdown the shared thread pool during app shutdown."""
+    global _thread_pool
+    if _thread_pool is None:
+        return
+    _thread_pool.shutdown(wait=False, cancel_futures=True)
+    _thread_pool = None
+
+
 async def run_in_thread_pool(func, *args, with_wait_time: bool = False, **kwargs):
     """Run a synchronous function in the thread pool.
 
@@ -316,6 +325,9 @@ async def search_with_answer(
             "search": float(core_timings.get("search", 0.0)),
             "llm": float(core_timings.get("llm", 0.0)),
             "core_total": float(core_timings.get("core_total", 0.0)),
+            "graph_status": core_timings.get("graph_status", "ok"),
+            "graph_retry_count": int(core_timings.get("graph_retry_count", 0)),
+            "graph_error": core_timings.get("graph_error", ""),
             "postprocess": postprocess_ms,
             "route_total": route_total_ms,
             "request_total": request_total_ms,

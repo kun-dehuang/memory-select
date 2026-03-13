@@ -102,9 +102,11 @@ fact_extraction_prompt = """从文本中提取事实信息，必须返回JSON格
 
 输入文本："""
 
-import mem0.memory.graph_memory
+import mem0.memory.graph_memory as mem0_graph_memory
+import mem0.llms.gemini as mem0_gemini
 
-_original_remove_spaces = mem0.memory.graph_memory.MemoryGraph._remove_spaces_from_entities
+_current_remove_spaces = mem0_graph_memory.MemoryGraph._remove_spaces_from_entities
+_original_remove_spaces = getattr(_current_remove_spaces, "_memory_select_original", _current_remove_spaces)
 
 
 def _patched_remove_spaces_from_entities(self, entity_list):
@@ -130,10 +132,35 @@ def _patched_remove_spaces_from_entities(self, entity_list):
     return _original_remove_spaces(self, filtered_entities)
 
 
-mem0.memory.graph_memory.MemoryGraph._remove_spaces_from_entities = _patched_remove_spaces_from_entities
+_patched_remove_spaces_from_entities._memory_select_original = _original_remove_spaces
+_patched_remove_spaces_from_entities._memory_select_patched = True
+if not getattr(mem0_graph_memory.MemoryGraph._remove_spaces_from_entities, "_memory_select_patched", False):
+    mem0_graph_memory.MemoryGraph._remove_spaces_from_entities = _patched_remove_spaces_from_entities
+
+_current_gemini_parse_response = mem0_gemini.GeminiLLM._parse_response
+_original_gemini_parse_response = getattr(
+    _current_gemini_parse_response,
+    "_memory_select_original",
+    _current_gemini_parse_response,
+)
+
+
+def _patched_gemini_parse_response(self, response, tools):
+    """Normalize Gemini tool responses so content is never None."""
+    parsed = _original_gemini_parse_response(self, response, tools)
+    if tools and isinstance(parsed, dict) and parsed.get("content") is None:
+        parsed["content"] = ""
+    return parsed
+
+
+_patched_gemini_parse_response._memory_select_original = _original_gemini_parse_response
+_patched_gemini_parse_response._memory_select_patched = True
+if not getattr(mem0_gemini.GeminiLLM._parse_response, "_memory_select_patched", False):
+    mem0_gemini.GeminiLLM._parse_response = _patched_gemini_parse_response
 
 
 # ============== LLM DEBUG LOGGING PATCH ==============
+_current_llm_generate = None
 _original_llm_generate = None
 
 
@@ -183,9 +210,12 @@ def _patched_llm_generate(self, messages, tools=None, tool_choice="auto", **kwar
 
 
 # Apply the patch
-if _original_llm_generate is None:
-    from mem0.llms.base import LLMBase
-    _original_llm_generate = LLMBase.generate_response
+from mem0.llms.base import LLMBase
+_current_llm_generate = LLMBase.generate_response
+_original_llm_generate = getattr(_current_llm_generate, "_memory_select_original", _current_llm_generate)
+_patched_llm_generate._memory_select_original = _original_llm_generate
+_patched_llm_generate._memory_select_patched = True
+if not getattr(LLMBase.generate_response, "_memory_select_patched", False):
     LLMBase.generate_response = _patched_llm_generate
 
 # ============== END FACT EXTRACTION DEBUG PATCH ==============
@@ -229,6 +259,16 @@ class Mem0Base(MemoryInterface):
 
     _shared_client = None
     _shared_config = None
+    _RECOVERABLE_GRAPH_ERROR_MARKERS = (
+        "broken pipe",
+        "failed to write data to connection",
+        "service unavailable",
+        "session expired",
+        "defunct connection",
+        "failed to obtain a connection",
+        "connection acquisition timeout",
+        "cannot resolve address",
+    )
 
     def __init__(self, user_id: Optional[str] = None, collection_name: Optional[str] = None):
         """Initialize Mem0 memory with graph support.
@@ -328,6 +368,134 @@ class Mem0Base(MemoryInterface):
         self._sync_client = Memory(self._config)
         self._init_timings["sync_client_init"] = (time.time() - sync_client_start) * 1000
         self._init_timings["instance_init_total"] = (time.time() - init_start) * 1000
+
+    def _close_sync_client(self) -> None:
+        client = getattr(self, "_sync_client", None)
+        if client is None:
+            return
+        close_method = getattr(client, "close", None)
+        if callable(close_method):
+            try:
+                close_method()
+            except Exception:
+                pass
+
+    def _refresh_sync_client(self) -> None:
+        self._close_sync_client()
+        self._sync_client = Memory(self._config)
+
+    def _is_recoverable_graph_error(self, error: Exception) -> bool:
+        error_type = error.__class__.__name__.lower()
+        error_message = str(error).lower()
+        if isinstance(error, BrokenPipeError):
+            return True
+        if error_type in {"serviceunavailable", "sessionexpired"}:
+            return True
+        return any(marker in error_message for marker in self._RECOVERABLE_GRAPH_ERROR_MARKERS)
+
+    def _extract_timestamp(self, metadata: dict[str, Any]) -> int:
+        timestamp = metadata.get("timestamp") or metadata.get("unixtime") or 0
+        try:
+            return int(timestamp) if timestamp is not None else 0
+        except (ValueError, TypeError):
+            return 0
+
+    def _search_vector_results(self, query: str, user_id: str, limit: int) -> list[SearchResult]:
+        filters = {"user_id": user_id}
+        start_time = time.time()
+        vector_results = self._sync_client._search_vector_store(query, filters, limit, threshold=None)
+        duration = (time.time() - start_time) * 1000
+
+        _get_debug_logger().log_api_call(
+            api_name="Mem0",
+            endpoint="search_vector_store",
+            request_data={"query": query, "user_id": user_id, "limit": limit},
+            response_data={"results_count": len(vector_results)},
+            duration_ms=duration
+        )
+
+        return [
+            self._with_timestamp(SearchResult(
+                memory_id=item.get("id", str(uuid.uuid4())),
+                content=item.get("memory", ""),
+                score=item.get("score", 1.0),
+                metadata=item.get("metadata", {}),
+            ), item.get("metadata", {}))
+            for item in vector_results
+        ]
+
+    def _with_timestamp(self, result: SearchResult, metadata: dict[str, Any]) -> SearchResult:
+        result._timestamp = self._extract_timestamp(metadata)
+        return result
+
+    def _search_graph_relations(self, query: str, user_id: str, limit: int) -> tuple[list[GraphSearchRelation], dict[str, Any]]:
+        graph_info: dict[str, Any] = {
+            "graph_status": "ok",
+            "graph_retry_count": 0,
+            "graph_error": "",
+        }
+
+        if not getattr(self._sync_client, "enable_graph", False) or not getattr(self._sync_client, "graph", None):
+            return [], graph_info
+
+        filters = {"user_id": user_id}
+        last_error: Optional[Exception] = None
+
+        for attempt in range(2):
+            try:
+                start_time = time.time()
+                relations_raw = self._sync_client.graph.search(query, filters, limit)
+                duration = (time.time() - start_time) * 1000
+                _get_debug_logger().log_api_call(
+                    api_name="Mem0",
+                    endpoint="search_graph",
+                    request_data={"query": query, "user_id": user_id, "limit": limit, "attempt": attempt + 1},
+                    response_data={"relations_count": len(relations_raw or [])},
+                    duration_ms=duration
+                )
+                return [
+                    GraphSearchRelation(
+                        source=item.get("source", ""),
+                        relationship=item.get("relationship", ""),
+                        destination=item.get("destination", "")
+                    )
+                    for item in (relations_raw or [])
+                ], graph_info
+            except Exception as error:
+                last_error = error
+                recoverable = self._is_recoverable_graph_error(error)
+                _get_debug_logger().log_error(
+                    f"Graph search attempt {attempt + 1}",
+                    error,
+                    f"recoverable={recoverable}"
+                )
+                if recoverable and attempt == 0:
+                    graph_info["graph_retry_count"] = 1
+                    self._refresh_sync_client()
+                    continue
+                break
+
+        graph_info["graph_status"] = "degraded"
+        graph_info["graph_error"] = str(last_error) if last_error else "Graph search failed"
+        return [], graph_info
+
+    def _attach_graph_relations(
+        self,
+        search_results: list[SearchResult],
+        graph_relations: list[GraphSearchRelation]
+    ) -> list[SearchResult]:
+        attached_results: list[SearchResult] = []
+        for result in search_results:
+            attached = SearchResult(
+                memory_id=result.memory_id,
+                content=result.content,
+                score=result.score,
+                metadata=result.metadata,
+                graph_relations=list(graph_relations),
+            )
+            attached._timestamp = getattr(result, "_timestamp", 0)
+            attached_results.append(attached)
+        return attached_results
 
     async def add(self, uid: str, text: str, metadata: dict) -> str:
         """Add a memory using mem0 with graph extraction (async).
@@ -563,34 +731,9 @@ class Mem0Standard(Mem0Base):
         actual_limit = limit * 3 if use_time_ranking else limit
 
         _get_debug_logger().logger.info(f"[SEARCH] Mem0Standard - query: '{query}', user_id: {user_id}, limit: {actual_limit}")
+        search_results = self._search_vector_results(query=query, user_id=user_id, limit=actual_limit)
 
-        start_time = time.time()
-        result = self._sync_client.search(
-            query=query,
-            user_id=user_id,
-            limit=actual_limit
-        )
-        duration = (time.time() - start_time) * 1000
-
-        _get_debug_logger().log_api_call(
-            api_name="Mem0",
-            endpoint="search",
-            request_data={"query": query, "user_id": user_id, "limit": actual_limit},
-            response_data=result,
-            duration_ms=duration
-        )
-
-        search_results = []
-        if result and "results" in result:
-            for item in result["results"]:
-                search_results.append(SearchResult(
-                    memory_id=item.get("id", str(uuid.uuid4())),
-                    content=item.get("memory", ""),
-                    score=item.get("score", 1.0),
-                    metadata=item.get("metadata", {})
-                ))
-
-        _get_debug_logger().logger.debug(f"[SEARCH] Found {len(search_results)} results in {duration:.2f}ms")
+        _get_debug_logger().logger.debug(f"[SEARCH] Found {len(search_results)} vector results")
         for i, sr in enumerate(search_results):  # Show all results
             _get_debug_logger().logger.debug(f"  [{i}] score={sr.score:.3f}: {sr.content}")  # No truncation
 
@@ -697,49 +840,37 @@ class Mem0Graph(Mem0Base):
             - content: The memory text (from vector search)
             - graph_relations: Related entities/relationships (from graph search)
         """
+        search_results, _ = self._search_with_graph_context(
+            query=query,
+            limit=limit,
+            uid=uid,
+            use_time_ranking=use_time_ranking,
+        )
+        return search_results
+
+    def _search_with_graph_context(
+        self,
+        query: str,
+        limit: int = 5,
+        uid: Optional[str] = None,
+        use_time_ranking: bool = False
+    ) -> tuple[list[SearchResult], dict[str, Any]]:
         user_id = uid or self.user_id
         actual_limit = limit * 3
 
         _get_debug_logger().logger.info(f"[SEARCH] Mem0Graph - query: '{query}', user_id: {user_id}, limit: {actual_limit}")
-
         search_start = time.time()
-        result = self._sync_client.search(
-            query=query,
-            user_id=user_id,
-            limit=actual_limit
-        )
+        vector_results = self._search_vector_results(query=query, user_id=user_id, limit=actual_limit)
+        graph_relations, graph_info = self._search_graph_relations(query=query, user_id=user_id, limit=actual_limit)
         search_duration = (time.time() - search_start) * 1000
 
-        search_results = []
-
-        memories = result.get("results", []) if result else []
-
-        relations_raw = result.get("relations", []) if result else []
-        graph_relations = [
-            GraphSearchRelation(
-                source=r.get("source", ""),
-                relationship=r.get("relationship", ""),
-                destination=r.get("destination", "")
-            )
-            for r in relations_raw
-        ]
-
-        for item in memories:
-            metadata = item.get("metadata", {})
-            timestamp = metadata.get("timestamp") or metadata.get("unixtime") or 0
-            search_results.append(SearchResult(
-                memory_id=item.get("id", str(uuid.uuid4())),
-                content=item.get("memory", ""),
-                score=item.get("score", 1.0),
-                metadata=metadata,
-                graph_relations=graph_relations,
-                _timestamp=int(timestamp) if isinstance(timestamp, (int, float)) else 0
-            ))
+        search_results = self._attach_graph_relations(vector_results, graph_relations)
 
         if use_time_ranking and search_results:
             search_results.sort(key=lambda x: (x._timestamp, x.score), reverse=True)
 
-        return search_results[:limit]
+        graph_info["search_duration_ms"] = search_duration
+        return search_results[:limit], graph_info
 
     def search_with_answer(
         self,
@@ -767,7 +898,7 @@ class Mem0Graph(Mem0Base):
 
         overall_start = time.time()
 
-        search_results = self.search(query=query, limit=limit, uid=user_id)
+        search_results, graph_info = self._search_with_graph_context(query=query, limit=limit, uid=user_id)
         search_time = (time.time() - overall_start) * 1000
 
         memories = [r.content for r in search_results if r.content]
@@ -800,6 +931,9 @@ class Mem0Graph(Mem0Base):
                 "search": search_time,
                 "llm": llm_time,
                 "core_total": total_time,
+                "graph_status": graph_info.get("graph_status", "ok"),
+                "graph_retry_count": graph_info.get("graph_retry_count", 0),
+                "graph_error": graph_info.get("graph_error", ""),
             }
         }
 
@@ -817,19 +951,8 @@ class Mem0Graph(Mem0Base):
             List of GraphSearchRelation objects
         """
         user_id = uid or self.user_id
-        filters = {"user_id": user_id}
-
-        if self._sync_client.enable_graph and self._sync_client.graph:
-            relations_raw = self._sync_client.graph.search(query, filters, limit)
-            return [
-                GraphSearchRelation(
-                    source=r.get("source", ""),
-                    relationship=r.get("relationship", ""),
-                    destination=r.get("destination", "")
-                )
-                for r in (relations_raw or [])
-            ]
-        return []
+        relations, _ = self._search_graph_relations(query=query, user_id=user_id, limit=limit)
+        return relations
 
     def get_graph_data(self, uid: Optional[str] = None) -> GraphVisualization:
         """Get graph data for visualization using mem0ai's graph.

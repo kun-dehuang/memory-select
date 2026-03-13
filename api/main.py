@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.routes import memory_router, logs_router
+from api.routes.memory import shutdown_thread_pool
 from api.dependencies import clear_memory_instance_cache
 from api.middleware import APILoggingMiddleware
 from api.schemas.openai_functions import OPENAI_FUNCTIONS_SCHEMA
@@ -26,6 +27,7 @@ async def lifespan(app: FastAPI):
     # Startup
     yield
     # Shutdown
+    shutdown_thread_pool()
     clear_memory_instance_cache()
 
 
