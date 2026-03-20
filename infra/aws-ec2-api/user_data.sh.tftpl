@@ -1,0 +1,100 @@
+#!/bin/bash
+set -euxo pipefail
+
+dnf update -y
+dnf install -y docker awscli util-linux
+
+systemctl enable --now docker
+systemctl enable --now amazon-ssm-agent
+
+mkdir -p /opt/${project_name}/bin /opt/${project_name}/runtime
+
+cat > /opt/${project_name}/bin/deploy.sh <<'SCRIPT'
+#!/bin/bash
+set -euo pipefail
+
+AWS_REGION="${aws_region}"
+APP_PORT="${app_port}"
+PROJECT_NAME="${project_name}"
+LOG_GROUP_NAME="${log_group_name}"
+ECR_REGISTRY="${ecr_registry}"
+ECR_REPOSITORY_URL="${ecr_repository_url}"
+GEMINI_PARAMETER="${gemini_parameter}"
+NEO4J_PASSWORD_PARAMETER="${neo4j_password_parameter}"
+QDRANT_API_KEY_PARAMETER="${qdrant_api_key_parameter}"
+MEM0_QDRANT_HOST="${mem0_qdrant_host}"
+MEM0_QDRANT_PORT="${mem0_qdrant_port}"
+QDRANT_HTTPS="${qdrant_https}"
+MEM0_NEO4J_URI="${mem0_neo4j_uri}"
+MEM0_NEO4J_USER="${mem0_neo4j_user}"
+LOCK_FILE="/opt/${project_name}/runtime/deploy.lock"
+IMAGE_TAG_FILE="/opt/${project_name}/runtime/image-tag"
+
+mkdir -p /opt/${project_name}/runtime
+exec 9>"$${LOCK_FILE}"
+flock 9
+
+if [[ $# -gt 0 && -n "$${1}" ]]; then
+  printf '%s' "$${1}" > "$${IMAGE_TAG_FILE}"
+elif [[ ! -f "$${IMAGE_TAG_FILE}" ]]; then
+  printf '%s' "${image_tag}" > "$${IMAGE_TAG_FILE}"
+fi
+
+IMAGE_TAG="$(cat "$${IMAGE_TAG_FILE}")"
+IMAGE_URI="$${ECR_REPOSITORY_URL}:$${IMAGE_TAG}"
+
+GEMINI_API_KEY="$(aws ssm get-parameter --region "$${AWS_REGION}" --name "$${GEMINI_PARAMETER}" --with-decryption --query 'Parameter.Value' --output text)"
+NEO4J_PASSWORD="$(aws ssm get-parameter --region "$${AWS_REGION}" --name "$${NEO4J_PASSWORD_PARAMETER}" --with-decryption --query 'Parameter.Value' --output text)"
+QDRANT_API_KEY="$(aws ssm get-parameter --region "$${AWS_REGION}" --name "$${QDRANT_API_KEY_PARAMETER}" --with-decryption --query 'Parameter.Value' --output text)"
+
+cat > /opt/${project_name}/.env <<ENVFILE
+PORT=${app_port}
+GEMINI_API_KEY=$${GEMINI_API_KEY}
+MEM0_QDRANT_HOST=$${MEM0_QDRANT_HOST}
+MEM0_QDRANT_PORT=$${MEM0_QDRANT_PORT}
+QDRANT_API_KEY=$${QDRANT_API_KEY}
+QDRANT_HTTPS=$${QDRANT_HTTPS}
+MEM0_NEO4J_URI=$${MEM0_NEO4J_URI}
+MEM0_NEO4J_USER=$${MEM0_NEO4J_USER}
+MEM0_NEO4J_PASSWORD=$${NEO4J_PASSWORD}
+ENVFILE
+
+aws ecr get-login-password --region "$${AWS_REGION}" | docker login --username AWS --password-stdin "$${ECR_REGISTRY}"
+docker pull "$${IMAGE_URI}"
+docker rm -f "$${PROJECT_NAME}" || true
+
+docker run -d \
+  --name "$${PROJECT_NAME}" \
+  --restart unless-stopped \
+  --env-file /opt/${project_name}/.env \
+  -p "$${APP_PORT}:$${APP_PORT}" \
+  --log-driver=awslogs \
+  --log-opt awslogs-region="$${AWS_REGION}" \
+  --log-opt awslogs-group="$${LOG_GROUP_NAME}" \
+  --log-opt awslogs-create-group="false" \
+  --log-opt awslogs-stream="$${PROJECT_NAME}" \
+  "$${IMAGE_URI}"
+SCRIPT
+
+chmod +x /opt/${project_name}/bin/deploy.sh
+
+cat > /etc/systemd/system/${project_name}.service <<'UNIT'
+[Unit]
+Description=Memory Select API container service
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/${project_name}/bin/deploy.sh
+ExecStop=-/usr/bin/docker rm -f ${project_name}
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable ${project_name}.service
+systemctl start ${project_name}.service

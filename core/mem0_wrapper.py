@@ -1,134 +1,58 @@
-"""Mem0 integration wrapper using official mem0ai library.
+"""Lean mem0 wrapper for the API-only memory service."""
 
-This wrapper uses the official mem0ai library with:
-- Vector Store: Qdrant (local)
-- Graph Store: Neo4j (local)
-- LLM: Gemini
-- Embedder: Gemini
+from __future__ import annotations
 
-Key design:
-- All data is written using graph-enabled mem0 (vector + graph together)
-- Write operations are async with parallel processing support
-- Search operations are synchronous
-"""
-
-import asyncio
+import logging
 import os
-import sys
-import uuid
 import time
-from abc import ABC, abstractmethod
-from pathlib import Path
+import uuid
 from typing import Any, Optional
 
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from mem0 import Memory, AsyncMemory
-from mem0.configs.base import MemoryConfig, VectorStoreConfig, GraphStoreConfig, LlmConfig
+from mem0 import AsyncMemory, Memory
+from mem0.configs.base import GraphStoreConfig, LlmConfig, MemoryConfig, VectorStoreConfig
 from mem0.embeddings.configs import EmbedderConfig
 
-from config import config
-from models import SearchResult, GraphEntity, GraphRelation, GraphVisualization, GraphSearchRelation
-
-debug_logger = None
-
-
-def _get_debug_logger():
-    """Lazy import and get debug logger.
-
-    In production (Railway), returns a simple logger that uses standard logging.
-    In local development, uses the custom utils.logger if available.
-    """
-    global debug_logger
-    if debug_logger is None:
-        import importlib.util
-        import sys
-        import logging
-        from pathlib import Path
-
-        logger_path = Path(__file__).parent.parent / "utils" / "logger.py"
-
-        # Try to load custom logger (local development)
-        if logger_path.exists():
-            try:
-                spec = importlib.util.spec_from_file_location("utils.logger", logger_path)
-                module = importlib.util.module_from_spec(spec)
-                sys.modules["utils.logger"] = module
-                spec.loader.exec_module(module)
-                debug_logger = module.get_debug_logger()
-                return debug_logger
-            except Exception:
-                pass  # Fall through to standard logger
-
-        # Fallback: create a simple logger for production
-        class SimpleLogger:
-            def __init__(self):
-                self.logger = logging.getLogger(__name__)
-                if not self.logger.handlers:
-                    handler = logging.StreamHandler()
-                    formatter = logging.Formatter(
-                        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-                    )
-                    handler.setFormatter(formatter)
-                    self.logger.addHandler(handler)
-                    self.logger.setLevel(logging.INFO)
-
-            def log_input(self, title, data):
-                self.logger.info(f"{title}: {data}")
-
-            def log_output(self, title, data):
-                self.logger.info(f"{title}: {data}")
-
-            def log_api_call(self, api_name, endpoint, request_data, response_data, duration_ms):
-                self.logger.info(f"{api_name} {endpoint} - {duration_ms:.2f}ms")
-
-            def log_error(self, operation, error, extra=""):
-                self.logger.error(f"{operation} failed: {error}. {extra}")
-
-        debug_logger = SimpleLogger()
-    return debug_logger
-
-fact_extraction_prompt = """从文本中提取事实信息，必须返回JSON格式：{{"facts": ["事实1", "事实2", ...]}}
-
-要求：
-1. 每个事实必须是完整的陈述句
-2. 将复杂信息拆分成多个独立事实
-3. 即使信息简单也必须提取至少一条事实
-4. 使用与输入相同的语言（中文输入用中文输出）
-
-提取所有可识别的信息：时间、人物、地点、动作、物品、感受、细节。
-
-输入文本："""
-
-import mem0.memory.graph_memory as mem0_graph_memory
 import mem0.llms.gemini as mem0_gemini
+import mem0.memory.graph_memory as mem0_graph_memory
+
+from core.llm import get_llm_client
+from models import GraphEntity, GraphRelation, GraphSearchRelation, GraphVisualization, SearchResult
+
+
+logger = logging.getLogger("memory_select.mem0")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+_RECOVERABLE_GRAPH_ERROR_MARKERS = (
+    "broken pipe",
+    "failed to write data to connection",
+    "service unavailable",
+    "session expired",
+    "defunct connection",
+    "failed to obtain a connection",
+    "connection acquisition timeout",
+    "cannot resolve address",
+)
+
 
 _current_remove_spaces = mem0_graph_memory.MemoryGraph._remove_spaces_from_entities
 _original_remove_spaces = getattr(_current_remove_spaces, "_memory_select_original", _current_remove_spaces)
 
 
 def _patched_remove_spaces_from_entities(self, entity_list):
-    """Filter out entities with empty source/destination/relationship before processing."""
     filtered_entities = []
     for item in entity_list:
         source = item.get("source", "").strip()
         destination = item.get("destination", "").strip()
         relationship = item.get("relationship", "").strip()
-
         if source and destination and relationship:
             item["source"] = source
             item["destination"] = destination
             item["relationship"] = relationship
             filtered_entities.append(item)
-        else:
-            import logging
-            logging.getLogger(__name__).warning(
-                f"Filtered out entity with empty field: source='{source}', "
-                f"destination='{destination}', relationship='{relationship}'"
-            )
-
     return _original_remove_spaces(self, filtered_entities)
 
 
@@ -146,7 +70,6 @@ _original_gemini_parse_response = getattr(
 
 
 def _patched_gemini_parse_response(self, response, tools):
-    """Normalize Gemini tool responses so content is never None."""
     parsed = _original_gemini_parse_response(self, response, tools)
     if tools and isinstance(parsed, dict) and parsed.get("content") is None:
         parsed["content"] = ""
@@ -159,330 +82,248 @@ if not getattr(mem0_gemini.GeminiLLM._parse_response, "_memory_select_patched", 
     mem0_gemini.GeminiLLM._parse_response = _patched_gemini_parse_response
 
 
-# ============== LLM DEBUG LOGGING PATCH ==============
-_current_llm_generate = None
-_original_llm_generate = None
+def _qdrant_config(collection_name: str) -> dict[str, Any]:
+    host = os.getenv("MEM0_QDRANT_HOST", "localhost").strip()
+    port = int(os.getenv("MEM0_QDRANT_PORT", "6333"))
+    api_key = os.getenv("QDRANT_API_KEY", "").strip()
+    https = os.getenv("QDRANT_HTTPS", "false").lower() == "true"
+
+    config: dict[str, Any] = {
+        "collection_name": collection_name,
+        "embedding_model_dims": 768,
+    }
+
+    if host.startswith("http://") or host.startswith("https://"):
+        config["url"] = host
+    elif api_key:
+        scheme = "https" if https else "http"
+        config["url"] = f"{scheme}://{host}:{port}"
+    else:
+        config["host"] = host
+        config["port"] = port
+
+    if api_key:
+        config["api_key"] = api_key
+
+    return config
 
 
-def _patched_llm_generate(self, messages, tools=None, tool_choice="auto", **kwargs):
-    """Patched LLM generate_response with detailed debug logging."""
-    global _original_llm_generate
+def _memory_config(collection_name: str) -> MemoryConfig:
+    gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+    gemini_model = os.getenv("GEMINI_MODEL", "models/gemini-2.0-flash")
 
-    logger = _get_debug_logger().logger
-
-    # Log input
-    logger.info("=" * 80)
-    logger.info("[LLM REQUEST] Provider: " + self.__class__.__name__)
-    logger.info("[LLM REQUEST] Messages:")
-    for msg in messages:
-        role = msg.get("role", "unknown")
-        content = msg.get("content", "")
-        # No truncation - log full content
-        logger.info(f"  [{role}]: {content}")
-
-    if tools:
-        logger.info(f"[LLM REQUEST] Tools: {len(tools)} tools")
-        for tool in tools:  # Show all tools
-            logger.info(f"  - {tool.get('name', 'unknown')}: {tool.get('description', '')}")  # No truncation
-
-    # Call original
-    start_time = time.time()
-    response = _original_llm_generate(self, messages=messages, tools=tools, tool_choice=tool_choice, **kwargs)
-    duration = (time.time() - start_time) * 1000
-
-    # Log response
-    logger.info(f"[LLM RESPONSE] Duration: {duration:.2f}ms")
-    logger.info(f"[LLM RESPONSE] Type: {type(response)}")
-    logger.info(f"[LLM RESPONSE] Content: {str(response)}")  # No truncation
-
-    # Check for tool_calls
-    if isinstance(response, dict):
-        if response.get("tool_calls"):
-            logger.info(f"[LLM RESPONSE] Tool calls: {len(response['tool_calls'])}")
-            for i, tc in enumerate(response["tool_calls"]):  # Show all tool calls
-                args = tc.get("arguments", {})
-                logger.info(f"  Tool {i+1}: args={str(args)}")  # No truncation
-        else:
-            logger.info(f"[LLM RESPONSE] No tool_calls, keys: {list(response.keys())}")
-
-    logger.info("=" * 80)
-    return response
-
-
-# Apply the patch
-from mem0.llms.base import LLMBase
-_current_llm_generate = LLMBase.generate_response
-_original_llm_generate = getattr(_current_llm_generate, "_memory_select_original", _current_llm_generate)
-_patched_llm_generate._memory_select_original = _original_llm_generate
-_patched_llm_generate._memory_select_patched = True
-if not getattr(LLMBase.generate_response, "_memory_select_patched", False):
-    LLMBase.generate_response = _patched_llm_generate
-
-# ============== END FACT EXTRACTION DEBUG PATCH ==============
-
-
-class MemoryInterface(ABC):
-    """Unified interface for memory systems."""
-
-    @abstractmethod
-    async def add(self, uid: str, text: str, metadata: dict) -> str:
-        """Add a single memory (async). Returns memory ID."""
-        pass
-
-    @abstractmethod
-    async def add_batch(self, records: list[dict], max_concurrency: int = 5) -> list[str]:
-        """Add multiple memories with parallel processing. Returns list of memory IDs."""
-        pass
-
-    @abstractmethod
-    def search(self, query: str, limit: int = 5, uid: Optional[str] = None) -> list[SearchResult]:
-        """Search memories (sync). Returns list of search results."""
-        pass
-
-    @abstractmethod
-    def clear(self) -> None:
-        """Clear all memories."""
-        pass
-
-    @abstractmethod
-    def count(self) -> int:
-        """Get total memory count."""
-        pass
-
-
-class Mem0Base(MemoryInterface):
-    """Base class for Mem0 memory systems.
-
-    All instances use graph-enabled mem0 for writing (vector + graph together).
-    Write operations are async, search operations are sync.
-    """
-
-    _shared_client = None
-    _shared_config = None
-    _RECOVERABLE_GRAPH_ERROR_MARKERS = (
-        "broken pipe",
-        "failed to write data to connection",
-        "service unavailable",
-        "session expired",
-        "defunct connection",
-        "failed to obtain a connection",
-        "connection acquisition timeout",
-        "cannot resolve address",
-    )
-
-    def __init__(self, user_id: Optional[str] = None, collection_name: Optional[str] = None):
-        """Initialize Mem0 memory with graph support.
-
-        Args:
-            user_id: User ID for isolation
-            collection_name: Optional custom collection name
-        """
-        import os
-
-        init_start = time.time()
-        self._init_timings: dict[str, float] = {}
-        self._init_metadata: dict[str, Any] = {}
-
-        self.user_id = user_id or "default_user"
-        self.collection_name = collection_name or f"memory_store_{self.user_id}"
-
-        # 直接从环境变量读取最新配置，避免使用缓存的 config 对象
-        env_read_start = time.time()
-        qdrant_host = os.getenv("MEM0_QDRANT_HOST", "localhost")
-        qdrant_port = os.getenv("MEM0_QDRANT_PORT", "6333")
-        qdrant_api_key = os.getenv("QDRANT_API_KEY", "")
-        neo4j_uri = os.getenv("MEM0_NEO4J_URI", "bolt://localhost:7687")
-        neo4j_user = os.getenv("MEM0_NEO4J_USER", "neo4j")
-        neo4j_password = os.getenv("MEM0_NEO4J_PASSWORD", "password123")
-        gemini_api_key = os.getenv("GEMINI_API_KEY", "")
-        gemini_model = os.getenv("GEMINI_MODEL", "models/gemini-2.0-flash")
-        self._init_timings["env_read"] = (time.time() - env_read_start) * 1000
-
-        # Build Qdrant config for local or cloud
-        qdrant_config_start = time.time()
-        qdrant_config = {
-            "collection_name": self.collection_name,
-            "embedding_model_dims": 768,
-        }
-
-        # For Qdrant Cloud, use url instead of host/port
-        if qdrant_api_key or qdrant_host.startswith("http"):
-            qdrant_config["url"] = qdrant_host
-            if qdrant_api_key:
-                qdrant_config["api_key"] = qdrant_api_key
-        else:
-            # Local Qdrant
-            qdrant_config["host"] = qdrant_host
-            qdrant_config["port"] = int(qdrant_port)
-        self._init_timings["qdrant_config_build"] = (time.time() - qdrant_config_start) * 1000
-        self._init_metadata["qdrant_mode"] = "cloud" if qdrant_api_key or qdrant_host.startswith("http") else "local"
-        self._init_metadata["neo4j_enabled"] = bool(neo4j_uri and neo4j_user)
-        self._init_metadata["collection_name"] = self.collection_name
-
-        memory_config_start = time.time()
-        self._config = MemoryConfig(
-            vector_store=VectorStoreConfig(
-                provider="qdrant",
-                config=qdrant_config
-            ),
+    return MemoryConfig(
+        vector_store=VectorStoreConfig(
+            provider="qdrant",
+            config=_qdrant_config(collection_name),
+        ),
+        llm=LlmConfig(
+            provider="gemini",
+            config={
+                "model": gemini_model,
+                "api_key": gemini_api_key,
+            },
+        ),
+        embedder=EmbedderConfig(
+            provider="gemini",
+            config={
+                "model": "models/gemini-embedding-001",
+                "api_key": gemini_api_key,
+            },
+        ),
+        graph_store=GraphStoreConfig(
+            provider="neo4j",
+            config={
+                "url": os.getenv("MEM0_NEO4J_URI", "bolt://localhost:7687"),
+                "username": os.getenv("MEM0_NEO4J_USER", "neo4j"),
+                "password": os.getenv("MEM0_NEO4J_PASSWORD", "password123"),
+                "database": "neo4j",
+            },
             llm=LlmConfig(
                 provider="gemini",
                 config={
                     "model": gemini_model,
                     "api_key": gemini_api_key,
-                }
-            ),
-            embedder=EmbedderConfig(
-                provider="gemini",
-                config={
-                    "model": "models/gemini-embedding-001",
-                    "api_key": gemini_api_key,
-                }
-            ),
-            graph_store=GraphStoreConfig(
-                provider="neo4j",
-                config={
-                    "url": neo4j_uri,
-                    "username": neo4j_user,
-                    "password": neo4j_password,
-                    "database": "neo4j",  # Neo4j Aura 默认数据库名
                 },
-                llm=LlmConfig(
-                    provider="gemini",
-                    config={
-                        "model": gemini_model,
-                        "api_key": gemini_api_key,
-                    }
-                ),
-                threshold=0.7,
             ),
-            #custom_fact_extraction_prompt=fact_extraction_prompt,
-        )
-        self._init_timings["memory_config_build"] = (time.time() - memory_config_start) * 1000
+            threshold=0.7,
+        ),
+    )
 
-        async_client_start = time.time()
+
+class Mem0Graph:
+    """API-facing mem0 wrapper that keeps vector and graph storage together."""
+
+    def __init__(self, user_id: Optional[str] = None, collection_name: Optional[str] = None):
+        self.user_id = user_id or "default_user"
+        self.collection_name = collection_name or f"memory_store_{self.user_id}"
+        self._config = _memory_config(self.collection_name)
         self._async_client = AsyncMemory(self._config)
-        self._init_timings["async_client_init"] = (time.time() - async_client_start) * 1000
-
-        sync_client_start = time.time()
         self._sync_client = Memory(self._config)
-        self._init_timings["sync_client_init"] = (time.time() - sync_client_start) * 1000
-        self._init_timings["instance_init_total"] = (time.time() - init_start) * 1000
+        self._cache_info: dict[str, Any] = {}
 
-    def _close_sync_client(self) -> None:
-        client = getattr(self, "_sync_client", None)
-        if client is None:
-            return
-        close_method = getattr(client, "close", None)
-        if callable(close_method):
-            try:
-                close_method()
-            except Exception:
-                pass
+    async def add(self, uid: str, text: str, metadata: dict[str, Any]) -> dict[str, Any]:
+        start_time = time.time()
+        payload = dict(metadata)
+        if "unixtime" in payload:
+            payload["timestamp"] = payload["unixtime"]
 
-    def _refresh_sync_client(self) -> None:
-        self._close_sync_client()
-        self._sync_client = Memory(self._config)
+        result = await self._async_client.add(
+            messages=[{"role": "user", "content": text}],
+            user_id=uid,
+            metadata=payload,
+        )
 
-    def _is_recoverable_graph_error(self, error: Exception) -> bool:
-        error_type = error.__class__.__name__.lower()
-        error_message = str(error).lower()
-        if isinstance(error, BrokenPipeError):
-            return True
-        if error_type in {"serviceunavailable", "sessionexpired"}:
-            return True
-        return any(marker in error_message for marker in self._RECOVERABLE_GRAPH_ERROR_MARKERS)
+        memory_id = str(uuid.uuid4())
+        if result and result.get("results"):
+            memory_id = result["results"][0].get("id", memory_id)
 
-    def _extract_timestamp(self, metadata: dict[str, Any]) -> int:
-        timestamp = metadata.get("timestamp") or metadata.get("unixtime") or 0
+        return {
+            "memory_id": memory_id,
+            "raw_result": result,
+            "timings": {"add": (time.time() - start_time) * 1000},
+        }
+
+    def search(self, query: str, limit: int = 5, uid: Optional[str] = None) -> list[SearchResult]:
+        user_id = uid or self.user_id
+        vector_results = self._search_vector_results(query=query, user_id=user_id, limit=limit * 3)
+        graph_relations = self._search_graph_relations(query=query, user_id=user_id, limit=limit * 3)
+        attached = self._attach_graph_relations(vector_results, graph_relations)
+        attached.sort(key=lambda item: (item._timestamp, item.score), reverse=True)
+        return attached[:limit]
+
+    def search_with_answer(self, query: str, limit: int = 5, uid: Optional[str] = None) -> dict[str, Any]:
+        overall_start = time.time()
+        results = self.search(query=query, limit=limit, uid=uid)
+        search_time = (time.time() - overall_start) * 1000
+
+        memories = [result.content for result in results if result.content]
+        relations = []
+        if results and results[0].graph_relations:
+            relations = [
+                {
+                    "source": relation.source,
+                    "relationship": relation.relationship,
+                    "destination": relation.destination,
+                }
+                for relation in results[0].graph_relations
+            ]
+
+        llm_start = time.time()
+        answer = get_llm_client().generate_graph_enhanced_answer(
+            question=query,
+            memories=memories,
+            relations=relations,
+        )
+        llm_time = (time.time() - llm_start) * 1000
+
+        return {
+            "answer": answer,
+            "memories": memories,
+            "relations": relations,
+            "raw_results": results,
+            "timings": {
+                "search": search_time,
+                "llm": llm_time,
+                "core_total": (time.time() - overall_start) * 1000,
+            },
+        }
+
+    def search_graph_only(self, query: str, limit: int = 5, uid: Optional[str] = None) -> list[GraphSearchRelation]:
+        user_id = uid or self.user_id
+        return self._search_graph_relations(query=query, user_id=user_id, limit=limit)
+
+    def get_graph_data(self, uid: Optional[str] = None) -> GraphVisualization:
+        user_id = uid or self.user_id
+        nodes: list[GraphEntity] = []
+        edges: list[GraphRelation] = []
+        seen_nodes: set[str] = set()
+
         try:
-            return int(timestamp) if timestamp is not None else 0
-        except (ValueError, TypeError):
-            return 0
+            if self._sync_client.enable_graph and self._sync_client.graph:
+                graph_data = self._sync_client.graph.get_all(filters={"user_id": user_id}, limit=100)
+                for item in graph_data:
+                    source_name = item.get("source", "")
+                    target_name = item.get("target", "")
+                    relationship = item.get("relationship", "")
+
+                    if source_name and source_name not in seen_nodes:
+                        nodes.append(GraphEntity(name=source_name, type="Entity", properties={}))
+                        seen_nodes.add(source_name)
+                    if target_name and target_name not in seen_nodes:
+                        nodes.append(GraphEntity(name=target_name, type="Entity", properties={}))
+                        seen_nodes.add(target_name)
+                    if source_name and target_name:
+                        edges.append(
+                            GraphRelation(
+                                source=source_name,
+                                target=target_name,
+                                relation_type=relationship,
+                                properties={},
+                            )
+                        )
+        except Exception:
+            logger.exception("Failed to fetch graph data for user_id=%s", user_id)
+
+        return GraphVisualization(nodes=nodes, edges=edges)
+
+    def clear(self) -> None:
+        self._sync_client.delete_all(user_id=self.user_id)
+        if self._sync_client.enable_graph and self._sync_client.graph:
+            try:
+                self._sync_client.graph.delete_all(filters={"user_id": self.user_id})
+            except Exception:
+                logger.exception("Failed to clear graph data for user_id=%s", self.user_id)
+
+    def count(self) -> int:
+        result = self._sync_client.get_all(user_id=self.user_id)
+        return len(result.get("results", [])) if result else 0
 
     def _search_vector_results(self, query: str, user_id: str, limit: int) -> list[SearchResult]:
-        filters = {"user_id": user_id}
-        start_time = time.time()
-        vector_results = self._sync_client._search_vector_store(query, filters, limit, threshold=None)
-        duration = (time.time() - start_time) * 1000
-
-        _get_debug_logger().log_api_call(
-            api_name="Mem0",
-            endpoint="search_vector_store",
-            request_data={"query": query, "user_id": user_id, "limit": limit},
-            response_data={"results_count": len(vector_results)},
-            duration_ms=duration
-        )
-
-        return [
-            self._with_timestamp(SearchResult(
+        items = self._sync_client._search_vector_store(query, {"user_id": user_id}, limit, threshold=None)
+        results: list[SearchResult] = []
+        for item in items:
+            result = SearchResult(
                 memory_id=item.get("id", str(uuid.uuid4())),
                 content=item.get("memory", ""),
                 score=item.get("score", 1.0),
                 metadata=item.get("metadata", {}),
-            ), item.get("metadata", {}))
-            for item in vector_results
-        ]
+            )
+            result._timestamp = self._extract_timestamp(result.metadata)
+            results.append(result)
+        return results
 
-    def _with_timestamp(self, result: SearchResult, metadata: dict[str, Any]) -> SearchResult:
-        result._timestamp = self._extract_timestamp(metadata)
-        return result
-
-    def _search_graph_relations(self, query: str, user_id: str, limit: int) -> tuple[list[GraphSearchRelation], dict[str, Any]]:
-        graph_info: dict[str, Any] = {
-            "graph_status": "ok",
-            "graph_retry_count": 0,
-            "graph_error": "",
-        }
-
+    def _search_graph_relations(self, query: str, user_id: str, limit: int) -> list[GraphSearchRelation]:
         if not getattr(self._sync_client, "enable_graph", False) or not getattr(self._sync_client, "graph", None):
-            return [], graph_info
+            return []
 
-        filters = {"user_id": user_id}
         last_error: Optional[Exception] = None
-
         for attempt in range(2):
             try:
-                start_time = time.time()
-                relations_raw = self._sync_client.graph.search(query, filters, limit)
-                duration = (time.time() - start_time) * 1000
-                _get_debug_logger().log_api_call(
-                    api_name="Mem0",
-                    endpoint="search_graph",
-                    request_data={"query": query, "user_id": user_id, "limit": limit, "attempt": attempt + 1},
-                    response_data={"relations_count": len(relations_raw or [])},
-                    duration_ms=duration
-                )
+                relations_raw = self._sync_client.graph.search(query, {"user_id": user_id}, limit)
                 return [
                     GraphSearchRelation(
                         source=item.get("source", ""),
                         relationship=item.get("relationship", ""),
-                        destination=item.get("destination", "")
+                        destination=item.get("destination", ""),
                     )
                     for item in (relations_raw or [])
-                ], graph_info
+                ]
             except Exception as error:
                 last_error = error
-                recoverable = self._is_recoverable_graph_error(error)
-                _get_debug_logger().log_error(
-                    f"Graph search attempt {attempt + 1}",
-                    error,
-                    f"recoverable={recoverable}"
-                )
-                if recoverable and attempt == 0:
-                    graph_info["graph_retry_count"] = 1
+                if attempt == 0 and self._is_recoverable_graph_error(error):
                     self._refresh_sync_client()
                     continue
                 break
 
-        graph_info["graph_status"] = "degraded"
-        graph_info["graph_error"] = str(last_error) if last_error else "Graph search failed"
-        return [], graph_info
+        if last_error is not None:
+            logger.warning("Graph search degraded for user_id=%s: %s", user_id, last_error)
+        return []
 
     def _attach_graph_relations(
         self,
         search_results: list[SearchResult],
-        graph_relations: list[GraphSearchRelation]
+        graph_relations: list[GraphSearchRelation],
     ) -> list[SearchResult]:
         attached_results: list[SearchResult] = []
         for result in search_results:
@@ -493,550 +334,33 @@ class Mem0Base(MemoryInterface):
                 metadata=result.metadata,
                 graph_relations=list(graph_relations),
             )
-            attached._timestamp = getattr(result, "_timestamp", 0)
+            attached._timestamp = result._timestamp
             attached_results.append(attached)
         return attached_results
 
-    async def add(self, uid: str, text: str, metadata: dict) -> str:
-        """Add a memory using mem0 with graph extraction (async).
-
-        This writes to BOTH vector store (facts) and graph store (entities/relations).
-
-        Args:
-            uid: User ID
-            text: Memory text content
-            metadata: Additional metadata
-
-        Returns:
-            Memory ID
-        """
-        _get_debug_logger().logger.info(f"[ADD MEMORY] User: {uid}, Text length: {len(text)}")
-        _get_debug_logger().log_input("Add memory input", {
-            "uid": uid,
-            "text": text,  # No truncation
-            "metadata": metadata
-        })
-
-        messages = [{"role": "user", "content": text}]
-        metadata_with_timestamp = dict(metadata)
-        if "unixtime" in metadata:
-            metadata_with_timestamp["timestamp"] = metadata["unixtime"]
-
-        max_retries = 3
-        retry_delay = 2
-
-        for attempt in range(max_retries):
+    def _refresh_sync_client(self) -> None:
+        close_method = getattr(self._sync_client, "close", None)
+        if callable(close_method):
             try:
-                start_time = time.time()
-                result = await self._async_client.add(
-                    messages,
-                    user_id=uid,
-                    metadata=metadata_with_timestamp
-                )
-                duration = (time.time() - start_time) * 1000
-
-                _get_debug_logger().log_api_call(
-                    api_name="Mem0",
-                    endpoint="add",
-                    request_data={"messages": messages, "user_id": uid, "metadata": metadata_with_timestamp},
-                    response_data=result,
-                    duration_ms=duration
-                )
-
-                if result and "results" in result:
-                    memories = result["results"]
-                    if memories:
-                        memory_id = memories[0].get("id", str(uuid.uuid4()))
-                        memory_text = memories[0].get("memory", "")
-                        _get_debug_logger().log_output("Memory add result", {
-                            "memory_id": memory_id,
-                            "memory": memory_text,
-                            "duration_ms": duration
-                        })
-                        return memory_id
-                    else:
-                        _get_debug_logger().logger.warning(f"[ADD MEMORY] No memories returned, duration: {duration:.2f}ms")
-                else:
-                    _get_debug_logger().logger.warning(f"[ADD MEMORY] Unexpected result format, duration: {duration:.2f}ms")
-                return str(uuid.uuid4())
-
-            except Exception as e:
-                duration = (time.time() - start_time) * 1000
-                error_str = str(e)
-                _get_debug_logger().log_error(
-                    f"Memory add (attempt {attempt + 1}/{max_retries})",
-                    e,
-                    f"Duration: {duration:.2f}ms"
-                )
-
-                if any(code in error_str for code in ["502", "500", "429", "Bad Gateway", "Server Error"]):
-                    if attempt < max_retries - 1:
-                        _get_debug_logger().logger.warning(
-                            f"API error (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {retry_delay}s..."
-                        )
-                        await asyncio.sleep(retry_delay)
-                        retry_delay *= 2
-                        continue
-                raise
-
-        return str(uuid.uuid4())
-
-    async def add_batch(self, records: list[dict], max_concurrency: int = 5) -> list[str]:
-        """Add multiple memories with async parallel processing using Semaphore.
-
-        Args:
-            records: List of dicts with 'uid', 'text', 'meta' keys
-            max_concurrency: Maximum number of concurrent operations (default: 5)
-
-        Returns:
-            List of memory IDs
-        """
-        _get_debug_logger().logger.info(f"[ADD BATCH] Starting batch add of {len(records)} records with max_concurrency={max_concurrency}")
-
-        semaphore = asyncio.Semaphore(max_concurrency)
-
-        async def _add_with_semaphore(index: int, record: dict) -> tuple[int, str]:
-            """Add a single record with semaphore control."""
-            async with semaphore:
-                try:
-                    memory_id = await self.add(
-                        uid=record.get("uid", ""),
-                        text=record["text"],
-                        metadata=record.get("meta", {})
-                    )
-                    return (index, memory_id)
-                except Exception as e:
-                    _get_debug_logger().log_error(f"Add batch record {index+1}", e)
-                    return (index, str(uuid.uuid4()))
-
-        tasks = [_add_with_semaphore(i, record) for i, record in enumerate(records)]
-        results = await asyncio.gather(*tasks)
-
-        results.sort(key=lambda x: x[0])
-        memory_ids = [result[1] for result in results]
-
-        success_count = sum(1 for mid in memory_ids if mid != str(uuid.uuid4()) or mid)
-        error_count = len(memory_ids) - success_count
-
-        _get_debug_logger().logger.info(f"[ADD BATCH] Complete: {success_count} success, {error_count} errors")
-        return memory_ids
-
-    def search(self, query: str, limit: int = 5, uid: Optional[str] = None) -> list[SearchResult]:
-        """Search memories (sync). To be implemented by subclasses."""
-        raise NotImplementedError("Subclasses must implement search method")
-
-    def clear(self) -> None:
-        """Clear all memories for this user."""
-        self._sync_client.delete_all(user_id=self.user_id)
-        if self._sync_client.enable_graph and self._sync_client.graph:
-            try:
-                self._sync_client.graph.delete_all(filters={"user_id": self.user_id})
+                close_method()
             except Exception:
-                pass
-
-    def count(self) -> int:
-        """Get total memory count."""
-        result = self._sync_client.get_all(user_id=self.user_id)
-        if result and "results" in result:
-            return len(result["results"])
-        return 0
-
-    def add_batch_sync(self, records: list[dict], max_concurrency: int = 5) -> list[str]:
-        """Synchronous wrapper for add_batch.
-
-        Args:
-            records: List of dicts with 'uid', 'text', 'meta' keys
-            max_concurrency: Maximum number of concurrent operations (default: 5)
-
-        Returns:
-            List of memory IDs
-        """
-        return asyncio.run(self.add_batch(records, max_concurrency))
-
-    def add_batch_pure_sync(self, records: list[dict]) -> list[str]:
-        """Pure synchronous batch import using sync client (no asyncio).
-
-        This method uses the synchronous Mem0 client directly, avoiding
-        any async/await overhead. Suitable for Streamlit and other
-        frameworks that don't work well with asyncio.
-
-        Args:
-            records: List of dicts with 'uid', 'text', 'meta' keys
-
-        Returns:
-            List of memory IDs
-        """
-        _get_debug_logger().logger.info(f"[ADD BATCH PURE SYNC] Starting sync batch add of {len(records)} records")
-
-        memory_ids = []
-        for i, record in enumerate(records):
-            try:
-                messages = [{"role": "user", "content": record["text"]}]
-                metadata = dict(record.get("meta", {}))
-                if "unixtime" in metadata:
-                    metadata["timestamp"] = metadata["unixtime"]
-
-                start_time = time.time()
-                result = self._sync_client.add(
-                    messages,
-                    user_id=record.get("uid", ""),
-                    metadata=metadata
-                )
-                duration = (time.time() - start_time) * 1000
-
-                if result and "results" in result and result["results"]:
-                    memory_id = result["results"][0].get("id", str(uuid.uuid4()))
-                    memory_ids.append(memory_id)
-                else:
-                    memory_ids.append(str(uuid.uuid4()))
-
-                _get_debug_logger().logger.debug(
-                    f"[ADD BATCH PURE SYNC] Record {i+1}/{len(records)} imported in {duration:.2f}ms"
-                )
-
-            except Exception as e:
-                _get_debug_logger().log_error(f"Add batch sync record {i+1}", e)
-                memory_ids.append(str(uuid.uuid4()))
-
-        _get_debug_logger().logger.info(f"[ADD BATCH PURE SYNC] Complete: {len(memory_ids)} records processed")
-        return memory_ids
-
-
-class Mem0Standard(Mem0Base):
-    """Mem0 Standard Memory - Vector search only.
-
-    Data is written to both vector and graph stores (via Mem0Base).
-    Search only returns vector store results (facts), ignoring graph data.
-    """
-
-    def search(
-        self,
-        query: str,
-        limit: int = 5,
-        uid: Optional[str] = None,
-        use_time_ranking: bool = False
-    ) -> list[SearchResult]:
-        """Search memories using vector search only (sync).
-
-        Args:
-            query: Search query text
-            limit: Max number of results
-            uid: Optional user ID filter
-            use_time_ranking: If True, sort results by timestamp (newest first)
-
-        Returns:
-            List of SearchResult objects (vector search results only)
-        """
-        user_id = uid or self.user_id
-        actual_limit = limit * 3 if use_time_ranking else limit
-
-        _get_debug_logger().logger.info(f"[SEARCH] Mem0Standard - query: '{query}', user_id: {user_id}, limit: {actual_limit}")
-        search_results = self._search_vector_results(query=query, user_id=user_id, limit=actual_limit)
-
-        _get_debug_logger().logger.debug(f"[SEARCH] Found {len(search_results)} vector results")
-        for i, sr in enumerate(search_results):  # Show all results
-            _get_debug_logger().logger.debug(f"  [{i}] score={sr.score:.3f}: {sr.content}")  # No truncation
-
-        if use_time_ranking and search_results:
-            indexed_results = []
-            for i, result in enumerate(search_results):
-                metadata = result.metadata
-                timestamp = metadata.get("timestamp") or metadata.get("unixtime") or "0"
-                try:
-                    ts_int = int(timestamp) if isinstance(timestamp, (int, float)) else 0
-                except (ValueError, TypeError):
-                    ts_int = 0
-
-                indexed_results.append({
-                    "index": i,
-                    "timestamp": ts_int,
-                    "score": result.score,
-                    "result": result
-                })
-
-            indexed_results.sort(key=lambda x: (x["timestamp"], x["score"]), reverse=True)
-
-            sorted_results = [item["result"] for item in indexed_results]
-            return sorted_results[:limit]
-
-        return search_results
-
-    def search_with_answer(
-        self,
-        query: str,
-        limit: int = 5,
-        uid: Optional[str] = None
-    ) -> dict:
-        """Search memories and generate LLM-enhanced answer (vector search only).
-
-        Args:
-            query: Search query text
-            limit: Max number of results
-            uid: Optional user ID filter
-
-        Returns:
-            Dictionary with:
-            - answer: LLM-generated answer
-            - memories: List of raw memory texts
-            - raw_results: Original SearchResult objects
-        """
-        from core.llm import get_llm_client
-
-        user_id = uid or self.user_id
-        overall_start = time.time()
-
-        search_results = self.search(query=query, limit=limit, uid=user_id)
-        search_time = (time.time() - overall_start) * 1000
-
-        memories = [r.content for r in search_results if r.content]
-
-        llm_client = get_llm_client()
-
-        llm_start = time.time()
-        answer = llm_client.generate_answer(
-            question=query,
-            memory_context=memories
-        )
-        llm_time = (time.time() - llm_start) * 1000
-
-        total_time = (time.time() - overall_start) * 1000
-
-        return {
-            "answer": answer,
-            "memories": memories,
-            "raw_results": search_results,
-            "timings": {
-                "search": search_time,
-                "llm": llm_time,
-                "core_total": total_time,
-            }
-        }
-
-
-class Mem0Graph(Mem0Base):
-    """Mem0 Graph Memory - Vector + Graph search.
-
-    Data is written to both vector and graph stores (via Mem0Base).
-    Search returns both vector results (facts) and graph results (entities/relations).
-    """
-
-    def search(
-        self,
-        query: str,
-        limit: int = 5,
-        uid: Optional[str] = None,
-        use_time_ranking: bool = False
-    ) -> list[SearchResult]:
-        """Search memories using both vector and graph search (sync).
-
-        Args:
-            query: Search query text
-            limit: Max number of results
-            uid: Optional user ID filter
-            use_time_ranking: If True, sort results by timestamp (newest first)
-
-        Returns:
-            List of SearchResult objects, each containing:
-            - content: The memory text (from vector search)
-            - graph_relations: Related entities/relationships (from graph search)
-        """
-        search_results, _ = self._search_with_graph_context(
-            query=query,
-            limit=limit,
-            uid=uid,
-            use_time_ranking=use_time_ranking,
-        )
-        return search_results
-
-    def _search_with_graph_context(
-        self,
-        query: str,
-        limit: int = 5,
-        uid: Optional[str] = None,
-        use_time_ranking: bool = False
-    ) -> tuple[list[SearchResult], dict[str, Any]]:
-        user_id = uid or self.user_id
-        actual_limit = limit * 3
-
-        _get_debug_logger().logger.info(f"[SEARCH] Mem0Graph - query: '{query}', user_id: {user_id}, limit: {actual_limit}")
-        search_start = time.time()
-        vector_results = self._search_vector_results(query=query, user_id=user_id, limit=actual_limit)
-        graph_relations, graph_info = self._search_graph_relations(query=query, user_id=user_id, limit=actual_limit)
-        search_duration = (time.time() - search_start) * 1000
-
-        search_results = self._attach_graph_relations(vector_results, graph_relations)
-
-        if use_time_ranking and search_results:
-            search_results.sort(key=lambda x: (x._timestamp, x.score), reverse=True)
-
-        graph_info["search_duration_ms"] = search_duration
-        return search_results[:limit], graph_info
-
-    def search_with_answer(
-        self,
-        query: str,
-        limit: int = 5,
-        uid: Optional[str] = None
-    ) -> dict:
-        """Search memories and generate LLM-enhanced answer combining vector and graph results.
-
-        Args:
-            query: Search query text
-            limit: Max number of results
-            uid: Optional user ID filter
-
-        Returns:
-            Dictionary with:
-            - answer: LLM-generated fused answer
-            - memories: List of raw memory texts
-            - relations: List of graph relations
-            - raw_results: Original SearchResult objects
-        """
-        from core.llm import get_llm_client
-
-        user_id = uid or self.user_id
-
-        overall_start = time.time()
-
-        search_results, graph_info = self._search_with_graph_context(query=query, limit=limit, uid=user_id)
-        search_time = (time.time() - overall_start) * 1000
-
-        memories = [r.content for r in search_results if r.content]
-
-        relations = []
-        if search_results and search_results[0].graph_relations:
-            relations = [
-                {"source": r.source, "relationship": r.relationship, "destination": r.destination}
-                for r in search_results[0].graph_relations
-            ]
-
-        llm_client = get_llm_client()
-
-        llm_start = time.time()
-        answer = llm_client.generate_graph_enhanced_answer(
-            question=query,
-            memories=memories,
-            relations=relations
-        )
-        llm_time = (time.time() - llm_start) * 1000
-
-        total_time = (time.time() - overall_start) * 1000
-
-        return {
-            "answer": answer,
-            "memories": memories,
-            "relations": relations,
-            "raw_results": search_results,
-            "timings": {
-                "search": search_time,
-                "llm": llm_time,
-                "core_total": total_time,
-                "graph_status": graph_info.get("graph_status", "ok"),
-                "graph_retry_count": graph_info.get("graph_retry_count", 0),
-                "graph_error": graph_info.get("graph_error", ""),
-            }
-        }
-
-    def search_graph_only(self, query: str, limit: int = 5, uid: Optional[str] = None) -> list[GraphSearchRelation]:
-        """Pure graph search - returns entities and relationships from the graph.
-
-        This searches ONLY the graph store (Neo4j), not the vector store.
-
-        Args:
-            query: Search query text
-            limit: Max number of results
-            uid: Optional user ID filter
-
-        Returns:
-            List of GraphSearchRelation objects
-        """
-        user_id = uid or self.user_id
-        relations, _ = self._search_graph_relations(query=query, user_id=user_id, limit=limit)
-        return relations
-
-    def get_graph_data(self, uid: Optional[str] = None) -> GraphVisualization:
-        """Get graph data for visualization using mem0ai's graph.
-
-        Args:
-            uid: Optional user ID filter
-
-        Returns:
-            GraphVisualization with nodes and edges
-        """
-        user_id = uid or self.user_id
-        nodes = []
-        edges = []
-
-        try:
-            if self._sync_client.enable_graph and self._sync_client.graph:
-                filters = {"user_id": user_id}
-                graph_data = self._sync_client.graph.get_all(filters=filters, limit=100)
-
-                seen_nodes = set()
-
-                for item in graph_data:
-                    source_name = item.get("source", "")
-                    target_name = item.get("target", "")
-                    relationship = item.get("relationship", "")
-                    rel_id = f"{source_name}-{relationship}-{target_name}"
-
-                    if source_name and source_name not in seen_nodes:
-                        nodes.append(GraphEntity(
-                            name=source_name,
-                            type="Entity",
-                            properties={}
-                        ))
-                        seen_nodes.add(source_name)
-
-                    if target_name and target_name not in seen_nodes:
-                        nodes.append(GraphEntity(
-                            name=target_name,
-                            type="Entity",
-                            properties={}
-                        ))
-                        seen_nodes.add(target_name)
-
-                    if source_name and target_name:
-                        edges.append(GraphRelation(
-                            source=source_name,
-                            target=target_name,
-                            relation_type=relationship,
-                            properties={}
-                        ))
-        except Exception as e:
-            pass
-
-        return GraphVisualization(nodes=nodes, edges=edges)
-
-
-class Mem0Factory:
-    """Factory for creating Mem0 instances.
-
-    Both 'standard' and 'graph' modes write to the same storage (vector + graph).
-    They differ only in search behavior:
-    - standard: Returns only vector search results
-    - graph: Returns vector + graph search results
-    """
+                logger.exception("Failed to close sync mem0 client before refresh")
+        self._sync_client = Memory(self._config)
 
     @staticmethod
-    def create(mode: str = "standard", user_id: Optional[str] = None, collection_name: Optional[str] = None) -> MemoryInterface:
-        """Create a Mem0 instance.
+    def _extract_timestamp(metadata: dict[str, Any]) -> int:
+        timestamp = metadata.get("timestamp") or metadata.get("unixtime") or 0
+        try:
+            return int(timestamp) if timestamp is not None else 0
+        except (ValueError, TypeError):
+            return 0
 
-        Args:
-            mode: 'standard' for vector-only search, 'graph' for vector+graph search
-            user_id: User ID for isolation
-            collection_name: Optional custom collection name
-
-        Returns:
-            MemoryInterface instance
-
-        Raises:
-            ValueError: If mode is invalid
-        """
-        mode = mode.lower()
-        if mode == "standard":
-            return Mem0Standard(user_id=user_id, collection_name=collection_name)
-        elif mode == "graph":
-            return Mem0Graph(user_id=user_id, collection_name=collection_name)
-        else:
-            raise ValueError(f"Invalid mode: {mode}. Use 'standard' or 'graph'")
+    @staticmethod
+    def _is_recoverable_graph_error(error: Exception) -> bool:
+        error_type = error.__class__.__name__.lower()
+        error_message = str(error).lower()
+        if isinstance(error, BrokenPipeError):
+            return True
+        if error_type in {"serviceunavailable", "sessionexpired"}:
+            return True
+        return any(marker in error_message for marker in _RECOVERABLE_GRAPH_ERROR_MARKERS)

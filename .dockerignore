@@ -1,0 +1,15 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+.DS_Store
+.env
+data
+logs
+ui
+infra
+scripts
+test_*.py
+*.csv
+AWS_DATASTORES_DEPLOYMENT.md

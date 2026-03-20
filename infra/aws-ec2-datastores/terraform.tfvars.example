@@ -1,0 +1,16 @@
+subnet_id      = "subnet-xxxxxxxxxxxxxxxxx"
+neo4j_password = "replace-with-a-strong-neo4j-password"
+
+# Optional but recommended if the service is shared by multiple apps.
+qdrant_api_key = "replace-with-a-strong-qdrant-api-key"
+
+# Optional overrides
+# instance_type               = "t3.large"
+# root_volume_size            = 80
+# allowed_cidr_blocks         = ["10.60.0.0/16"]
+# additional_security_group_ids = ["sg-xxxxxxxxxxxxxxxxx"]
+# associate_public_ip_address = false
+# tags = {
+#   Environment = "dev"
+#   Owner       = "platform"
+# }

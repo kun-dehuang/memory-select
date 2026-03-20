@@ -1,0 +1,109 @@
+#!/bin/bash
+set -euxo pipefail
+
+dnf update -y
+dnf install -y docker awscli util-linux
+
+systemctl enable --now docker
+systemctl enable --now amazon-ssm-agent
+
+mkdir -p /opt/${project_name}/bin /opt/${project_name}/runtime
+mkdir -p /var/lib/${project_name}/neo4j/data /var/lib/${project_name}/neo4j/logs
+mkdir -p /var/lib/${project_name}/qdrant/storage
+
+cat > /opt/${project_name}/bin/deploy.sh <<'SCRIPT'
+#!/bin/bash
+set -euo pipefail
+
+AWS_REGION="${aws_region}"
+PROJECT_NAME="${project_name}"
+NEO4J_HTTP_PORT="${neo4j_http_port}"
+NEO4J_BOLT_PORT="${neo4j_bolt_port}"
+QDRANT_HTTP_PORT="${qdrant_http_port}"
+QDRANT_GRPC_PORT="${qdrant_grpc_port}"
+NEO4J_PASSWORD_PARAMETER="${neo4j_password_parameter}"
+QDRANT_API_KEY_PARAMETER="${qdrant_api_key_parameter}"
+
+NEO4J_PASSWORD="$(
+  aws ssm get-parameter \
+    --region "$${AWS_REGION}" \
+    --name "$${NEO4J_PASSWORD_PARAMETER}" \
+    --with-decryption \
+    --query 'Parameter.Value' \
+    --output text
+)"
+
+QDRANT_API_KEY=""
+if [[ -n "$${QDRANT_API_KEY_PARAMETER}" ]]; then
+  QDRANT_API_KEY="$(
+    aws ssm get-parameter \
+      --region "$${AWS_REGION}" \
+      --name "$${QDRANT_API_KEY_PARAMETER}" \
+      --with-decryption \
+      --query 'Parameter.Value' \
+      --output text
+  )"
+fi
+
+docker network create "$${PROJECT_NAME}" >/dev/null 2>&1 || true
+
+docker pull qdrant/qdrant:v1.12.0
+docker pull neo4j:5.24-community
+
+docker rm -f "$${PROJECT_NAME}-qdrant" >/dev/null 2>&1 || true
+docker rm -f "$${PROJECT_NAME}-neo4j" >/dev/null 2>&1 || true
+
+qdrant_args=(
+  run -d
+  --name "$${PROJECT_NAME}-qdrant"
+  --restart unless-stopped
+  --network "$${PROJECT_NAME}"
+  -p "$${QDRANT_HTTP_PORT}:$${QDRANT_HTTP_PORT}"
+  -p "$${QDRANT_GRPC_PORT}:$${QDRANT_GRPC_PORT}"
+  -v "/var/lib/${project_name}/qdrant/storage:/qdrant/storage"
+  -e "QDRANT__SERVICE__HTTP_PORT=$${QDRANT_HTTP_PORT}"
+  -e "QDRANT__SERVICE__GRPC_PORT=$${QDRANT_GRPC_PORT}"
+)
+
+if [[ -n "$${QDRANT_API_KEY}" ]]; then
+  qdrant_args+=(-e "QDRANT__SERVICE__API_KEY=$${QDRANT_API_KEY}")
+fi
+
+qdrant_args+=(qdrant/qdrant:v1.12.0)
+docker "$${qdrant_args[@]}"
+
+docker run -d \
+  --name "$${PROJECT_NAME}-neo4j" \
+  --restart unless-stopped \
+  --network "$${PROJECT_NAME}" \
+  -p "$${NEO4J_HTTP_PORT}:$${NEO4J_HTTP_PORT}" \
+  -p "$${NEO4J_BOLT_PORT}:$${NEO4J_BOLT_PORT}" \
+  -v "/var/lib/${project_name}/neo4j/data:/data" \
+  -v "/var/lib/${project_name}/neo4j/logs:/logs" \
+  -e "NEO4J_AUTH=neo4j/$${NEO4J_PASSWORD}" \
+  -e 'NEO4J_PLUGINS=["apoc"]' \
+  neo4j:5.24-community
+SCRIPT
+
+chmod +x /opt/${project_name}/bin/deploy.sh
+
+cat > /etc/systemd/system/${project_name}.service <<'UNIT'
+[Unit]
+Description=Neo4j and Qdrant containers for ${project_name}
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/${project_name}/bin/deploy.sh
+ExecStop=-/usr/bin/docker rm -f ${project_name}-neo4j ${project_name}-qdrant
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable ${project_name}.service
+systemctl start ${project_name}.service

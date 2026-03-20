@@ -1,24 +1,14 @@
-"""Memory API routes.
-
-Provides REST endpoints for memory operations including:
-- Add memory
-- Search memory (vector + graph)
-- Search graph only
-- Search with AI answer
-- Get graph visualization data
-- Clear memories
-- Count memories
-"""
+"""Memory API routes."""
 
 import asyncio
+import logging
 import time
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query
 
 from api.dependencies import get_memory_instance
-from utils.logger import get_debug_logger
 from api.schemas.requests import (
     AddMemoryRequest,
     SearchMemoryRequest,
@@ -37,9 +27,7 @@ from api.schemas.responses import (
 )
 
 router = APIRouter(prefix="/api/v1/memory", tags=["memory"])
-
-# Initialize debug logger for detailed logging
-debug_logger = get_debug_logger()
+logger = logging.getLogger("memory_select.api")
 
 # Create a thread pool executor for running synchronous operations
 # This helps prevent thread exhaustion in containerized environments
@@ -50,7 +38,6 @@ def get_thread_pool() -> ThreadPoolExecutor:
     """Get or create the shared thread pool executor."""
     global _thread_pool
     if _thread_pool is None:
-        # Limit to 4 workers to avoid thread exhaustion in Railway
         _thread_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mem_sync_")
     return _thread_pool
 
@@ -90,88 +77,23 @@ async def run_in_thread_pool(func, *args, with_wait_time: bool = False, **kwargs
 
 @router.post("/add", response_model=AddMemoryResponse)
 async def add_memory(request: AddMemoryRequest) -> AddMemoryResponse:
-    """Add a new memory with automatic entity and relationship extraction.
-
-    The memory is stored in both vector store (for semantic search)
-    and graph store (for entity relationships).
-    """
+    """Add a new memory."""
     start_time = time.time()
     try:
         memory = get_memory_instance(request.uid)
-
-        # Log the add request
-        debug_logger.log_api_request(
-            endpoint="/api/v1/memory/add",
-            method="POST",
-            uid=request.uid,
-            request_data={
-                "text": request.text,
-                "metadata": request.metadata
-            }
-        )
-
-        # Get the underlying mem0 client to capture detailed response
-        add_start = time.time()
-        result = await memory._async_client.add(
-            messages=[{"role": "user", "content": request.text}],
-            user_id=request.uid,
-            metadata=request.metadata or {}
-        )
-        add_duration_ms = (time.time() - add_start) * 1000
-        duration_ms = (time.time() - start_time) * 1000
-
-        # Extract and log fact splits and entities/relations
-        facts = []
-        entities = []
-        relations = []
-        memory_id = ""
-
-        if result and "results" in result and result["results"]:
-            memory_data = result["results"][0]
-            memory_id = memory_data.get("id", "")
-            facts.append(memory_data.get("memory", ""))
-
-            # Check for graph data in the response
-            if "graph" in memory_data:
-                graph_data = memory_data["graph"]
-                entities = graph_data.get("entities", [])
-                relations = graph_data.get("relationships", [])
-
-        # Log detailed fact split information
-        debug_logger.log_fact_split(
-            text=request.text,
-            facts=facts,
-            entities=entities,
-            relations=relations
-        )
-
-        # Log the API response
-        debug_logger.log_api_response(
-            endpoint="/api/v1/memory/add",
-            status="success",
-            response_data={
-                "memory_id": memory_id,
-                "facts_count": len(facts),
-                "entities_count": len(entities),
-                "relations_count": len(relations)
-            },
-            duration_ms=duration_ms
-        )
+        result = await memory.add(request.uid, request.text, request.metadata or {})
 
         return AddMemoryResponse(
             success=True,
-            memory_id=memory_id,
+            memory_id=result["memory_id"],
             message="Memory added successfully",
-            timings={"add": add_duration_ms}
+            timings={
+                **result.get("timings", {}),
+                "total": (time.time() - start_time) * 1000,
+            },
         )
     except Exception as e:
-        duration_ms = (time.time() - start_time) * 1000
-        debug_logger.log_api_response(
-            endpoint="/api/v1/memory/add",
-            status="error",
-            error=str(e),
-            duration_ms=duration_ms
-        )
+        logger.exception("Failed to add memory for uid=%s", request.uid)
         raise HTTPException(status_code=500, detail=f"Failed to add memory: {str(e)}")
 
 
@@ -212,11 +134,7 @@ async def search_memory(request: SearchMemoryRequest) -> SearchMemoryResponse:
 
 @router.post("/search-graph", response_model=SearchGraphOnlyResponse)
 async def search_graph_only(request: SearchGraphOnlyRequest) -> SearchGraphOnlyResponse:
-    """Search only the knowledge graph for entity relationships.
-
-    This searches ONLY the graph store (Neo4j), not the vector store.
-    Useful for exploring relationships between entities.
-    """
+    """Search only the knowledge graph for entity relationships."""
     try:
         start_time = time.time()
         memory = get_memory_instance(request.uid) if request.uid else get_memory_instance("default_user")
@@ -241,37 +159,14 @@ async def search_graph_only(request: SearchGraphOnlyRequest) -> SearchGraphOnlyR
 @router.post("/search-with-answer", response_model=SearchWithAnswerResponse)
 async def search_with_answer(
     request: SearchWithAnswerRequest,
-    raw_request: Request
 ) -> SearchWithAnswerResponse:
-    """Search memories and generate an AI-powered answer.
-
-    Combines vector search, graph relationships, and LLM to generate
-    a comprehensive answer to the user's question.
-    """
+    """Search memories and generate an AI-powered answer."""
     start_time = time.time()
     uid = request.uid or "default_user"
 
     try:
-        # Log the search request
-        debug_logger.log_api_request(
-            endpoint="/api/v1/memory/search-with-answer",
-            method="POST",
-            uid=uid,
-            request_data={
-                "query": request.query,
-                "limit": request.limit
-            }
-        )
-
-        instance_init_start = time.time()
         memory = get_memory_instance(uid)
-        instance_init_ms = (time.time() - instance_init_start) * 1000
-        instance_init_breakdown = dict(getattr(memory, "_init_timings", {}))
-        instance_init_breakdown.update(dict(getattr(memory, "_init_metadata", {})))
-        instance_init_breakdown.update(dict(getattr(memory, "_cache_info", {})))
-        instance_init_breakdown["instance_init_total"] = instance_init_ms
 
-        # Run the synchronous search_with_answer in a thread pool to avoid thread issues
         result, thread_wait_ms = await run_in_thread_pool(
             memory.search_with_answer,
             with_wait_time=True,
@@ -280,26 +175,8 @@ async def search_with_answer(
             uid=uid
         )
 
-        postprocess_start = time.time()
-        # Extract raw results and relations for logging
         raw_results = result.get("raw_results", [])
         relations = result.get("relations", [])
-
-        # Log detailed search results
-        debug_logger.log_search_results(
-            query=request.query,
-            results=[
-                {
-                    "memory_id": r.memory_id,
-                    "content": r.content,
-                    "score": r.score,
-                    "metadata": r.metadata,
-                }
-                for r in raw_results
-            ],
-            relations=relations,
-            limit=request.limit
-        )
 
         result_responses = [
             SearchResultResponse(
@@ -311,43 +188,6 @@ async def search_with_answer(
             )
             for r in raw_results
         ]
-        postprocess_ms = (time.time() - postprocess_start) * 1000
-
-        route_total_ms = (time.time() - start_time) * 1000
-        request_start_time = getattr(raw_request.state, "request_start_time", start_time)
-        request_total_ms = (time.time() - request_start_time) * 1000
-
-        core_timings = dict(result.get("timings", {}))
-        server_timings = {
-            "instance_init": instance_init_ms,
-            "instance_init_breakdown": instance_init_breakdown,
-            "thread_wait": thread_wait_ms,
-            "search": float(core_timings.get("search", 0.0)),
-            "llm": float(core_timings.get("llm", 0.0)),
-            "core_total": float(core_timings.get("core_total", 0.0)),
-            "graph_status": core_timings.get("graph_status", "ok"),
-            "graph_retry_count": int(core_timings.get("graph_retry_count", 0)),
-            "graph_error": core_timings.get("graph_error", ""),
-            "postprocess": postprocess_ms,
-            "route_total": route_total_ms,
-            "request_total": request_total_ms,
-        }
-        timings = {
-            "server": server_timings,
-            "client": {},
-        }
-
-        # Log the API response
-        debug_logger.log_api_response(
-            endpoint="/api/v1/memory/search-with-answer",
-            status="success",
-            response_data={
-                "results_count": len(result_responses),
-                "relations_count": len(relations),
-                "answer_length": len(result.get("answer", ""))
-            },
-            duration_ms=request_total_ms
-        )
 
         return SearchWithAnswerResponse(
             query=request.query,
@@ -355,25 +195,20 @@ async def search_with_answer(
             memories=result.get("memories", []),
             relations=relations,
             raw_results=result_responses,
-            timings=timings
+            timings={
+                **result.get("timings", {}),
+                "thread_wait": thread_wait_ms,
+                "total": (time.time() - start_time) * 1000,
+            },
         )
     except Exception as e:
-        duration_ms = (time.time() - start_time) * 1000
-        debug_logger.log_api_response(
-            endpoint="/api/v1/memory/search-with-answer",
-            status="error",
-            error=str(e),
-            duration_ms=duration_ms
-        )
+        logger.exception("Search with answer failed for uid=%s", uid)
         raise HTTPException(status_code=500, detail=f"Search with answer failed: {str(e)}")
 
 
 @router.get("/graph", response_model=GetGraphDataResponse)
 async def get_graph_data(uid: Optional[str] = Query(None, description="User ID filter")) -> GetGraphDataResponse:
-    """Get complete graph visualization data.
-
-    Returns nodes (entities) and edges (relationships) for visualization.
-    """
+    """Get complete graph visualization data."""
     try:
         memory = get_memory_instance(uid) if uid else get_memory_instance("default_user")
         # Run the synchronous get_graph_data in a thread pool
@@ -394,10 +229,7 @@ async def get_graph_data(uid: Optional[str] = Query(None, description="User ID f
 
 @router.delete("/clear", response_model=ClearMemoryResponse)
 async def clear_memory(uid: str = Query(..., description="User ID to clear memories for")) -> ClearMemoryResponse:
-    """Clear all stored memories for a user.
-
-    This deletes both vector store and graph store data for the user.
-    """
+    """Clear all stored memories for a user."""
     try:
         memory = get_memory_instance(uid)
         # Run the synchronous clear in a thread pool
